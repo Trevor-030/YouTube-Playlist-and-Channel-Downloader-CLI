@@ -61,6 +61,7 @@ echo   Usage examples:
 echo     yt download "PLAYLIST_URL"
 echo     yt download "PLAYLIST_URL" -q 1080p
 echo     yt download "PLAYLIST_URL" -o "D:\Videos"
+echo     yt channel "CHANNEL_URL"
 echo     yt info    "PLAYLIST_URL"
 echo     yt history
 echo     yt config  --output "D:\Videos" --quality 720p

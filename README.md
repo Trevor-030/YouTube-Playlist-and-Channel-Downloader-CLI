@@ -1,6 +1,6 @@
-# 🎬 YouTube Playlist Downloader — Windows Edition
+# 🎬 YouTube Playlist & Channel Downloader — Windows Edition
 
-A CLI tool to download YouTube playlists with quality selection, resume support, and history tracking.
+A CLI tool to download YouTube playlists and entire channels with quality selection, resume support, and history tracking.
 
 ---
 
@@ -57,7 +57,22 @@ yt download "URL" --start 3 --end 10
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
-:: Preview playlist contents without downloading
+:: Download EVERY video from a channel (@handle, /channel/UC…, /c/… all work)
+yt channel "https://www.youtube.com/@ChannelName"
+yt channel "URL" -q 720p -o "D:\Videos"
+
+:: Re-run the same command later to grab only NEW uploads
+yt channel "URL"
+
+:: Extras: include Shorts and live streams, latest 50 only, or only since a date
+yt channel "URL" --tabs all
+yt channel "URL" --limit 50
+yt channel "URL" --since 20240101
+
+:: Pasting a channel URL into `download` also switches to channel mode
+yt download "https://www.youtube.com/@ChannelName"
+
+:: Preview playlist (or channel) contents without downloading
 yt info "URL"
 
 :: View download history
@@ -97,6 +112,12 @@ D:\Videos\
 
 ---
 
+Channel downloads go to `<output>\Channel Name\2024-03-15 - Video Title [id].mp4`
+(with `--tabs all`, each tab gets its own subfolder). Finished videos are logged in
+`<output>\Channel Name\downloaded.txt`, which is what makes re-runs skip what you already have.
+
+---
+
 ## 🎛️ Quality Options
 
 | Option  | Description               |
@@ -131,3 +152,5 @@ yt history --last 50
 | `ERROR: Unable to download` | Update yt-dlp: `pip install -U yt-dlp` |
 | Filenames look weird | Already handled — Windows-safe filenames enabled |
 | Video has no sound | ffmpeg is missing or not on PATH |
+| Channel run stops / gets slow | Ctrl+C and re-run the same command; it resumes. Update yt-dlp if YouTube changed |
+| Members-only / private videos | Skipped and listed as errors in the summary |
