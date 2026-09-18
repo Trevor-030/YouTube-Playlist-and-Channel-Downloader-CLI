@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube Playlist Downloader CLI  —  Windows Edition
+YouTube Playlist & Channel Downloader CLI  —  Windows Edition
 -----------------------------------------------------
 Requirements:
     pip install yt-dlp rich click
@@ -8,6 +8,7 @@ Requirements:
 """
 
 import os
+import re
 import json
 import sys
 import shutil
@@ -17,6 +18,7 @@ from pathlib import Path, WindowsPath
 
 try:
     import yt_dlp
+    from yt_dlp.utils import sanitize_filename
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn
     from rich.table import Table
@@ -122,6 +124,45 @@ def fetch_playlist_info(url: str) -> dict | None:
             return None
 
 
+# ── Channel helpers ────────────────────────────────────────────────────────────
+
+CHANNEL_TABS = ("videos", "shorts", "streams")
+_CHANNEL_RE = re.compile(r"youtube\.com/(@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+)", re.I)
+_TAB_RE = re.compile(r"/(videos|shorts|streams|live|featured|playlists|releases|podcasts|community|about)$", re.I)
+
+
+def is_channel_url(url: str) -> bool:
+    """True for @handle, /channel/UC…, /c/name and /user/name URLs (not playlists or single videos)."""
+    return bool(_CHANNEL_RE.search(url)) and "list=" not in url and "watch?v=" not in url
+
+
+def channel_base(url: str) -> str:
+    """Strip query string and any trailing tab (/videos, /shorts, …) from a channel URL."""
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    return _TAB_RE.sub("", url)
+
+
+def resolve_url(url: str) -> str:
+    """Point a bare channel URL at its Videos tab so yt-dlp returns videos, not tab playlists."""
+    return f"{channel_base(url)}/videos" if is_channel_url(url) else url
+
+
+class _ErrorLog:
+    """yt-dlp logger that stays quiet but remembers errors (private/members-only videos, etc.)."""
+    def __init__(self):
+        self.errors = []
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): self.errors.append(str(msg))
+
+
+def read_archive_ids(archive: Path) -> set:
+    if not archive.exists():
+        return set()
+    return {line.split()[-1] for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
                    playlist_start: int, playlist_end: int) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
@@ -180,8 +221,14 @@ def cli():
               help="Start from this playlist index")
 @click.option("--end", default=0, show_default=True,
               help="End at this playlist index  (0 = all)")
-def download(url, output, quality, resume, start, end):
-    """Download a YouTube playlist or single video."""
+@click.pass_context
+def download(ctx, url, output, quality, resume, start, end):
+    """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
+
+    if is_channel_url(url):
+        console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
+        return ctx.invoke(channel, url=url, output=output, quality=quality,
+                          tabs="videos", limit=end, since=None, yes=False)
 
     require_ffmpeg()
 
@@ -299,6 +346,170 @@ def download(url, output, quality, resume, start, end):
     console.print(f"    (Open in Explorer:  [dim]explorer \"{output}\"[/dim])")
 
 
+# ── channel ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("url")
+@click.option("-o", "--output", default=None,
+              help="Output folder  (default from config)")
+@click.option("-q", "--quality", default=None,
+              type=click.Choice(["best", "1080p", "720p", "480p", "360p"]),
+              help="Video quality  (default from config)")
+@click.option("--tabs", default="videos", show_default=True,
+              help="Channel tabs to grab: videos, shorts, streams (comma-separated) or 'all'")
+@click.option("--limit", default=0, show_default=True,
+              help="Max videos per tab, newest first  (0 = everything)")
+@click.option("--since", default=None,
+              help="Only videos uploaded on/after this date, YYYYMMDD")
+@click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
+def channel(url, output, quality, tabs, limit, since, yes):
+    """Download ALL videos from a channel.
+
+    Re-run the same command later to fetch only new uploads
+    (finished videos are tracked in <channel folder>\\downloaded.txt).
+    """
+    require_ffmpeg()
+
+    cfg = load_config()
+    output  = safe_win_path(output or cfg.get("default_output", DEFAULT_OUTPUT))
+    quality = quality or cfg.get("default_quality", "best")
+
+    wanted = list(CHANNEL_TABS) if tabs.strip().lower() == "all" \
+        else [t.strip().lower() for t in tabs.split(",") if t.strip()]
+    bad = [t for t in wanted if t not in CHANNEL_TABS]
+    if bad or not wanted:
+        raise click.BadParameter(f"choose from: {', '.join(CHANNEL_TABS)} or 'all'", param_hint="--tabs")
+    if since and not re.fullmatch(r"\d{8}", since):
+        raise click.BadParameter("use YYYYMMDD, e.g. 20240101", param_hint="--since")
+
+    console.print(Panel.fit(
+        "📺  [bold cyan]YouTube Channel Downloader[/bold cyan]  —  Windows Edition",
+        border_style="cyan"
+    ))
+
+    # ── Scan the channel ──────────────────────────────────────────────────────
+    base = channel_base(url)
+    console.print("\n[yellow]⏳ Scanning channel (large channels can take a minute)…[/yellow]")
+
+    tab_entries, channel_name = {}, None
+    for tab in wanted:
+        data = fetch_playlist_info(f"{base}/{tab}")
+        entries = [e for e in ((data or {}).get("entries") or []) if e]
+        if not entries:
+            console.print(f"  [dim]{tab}: nothing found, skipping[/dim]")
+            continue
+        channel_name = channel_name or data.get("channel") or data.get("uploader") or data.get("title")
+        tab_entries[tab] = entries[:limit] if limit > 0 else entries
+
+    if not tab_entries:
+        console.print("[red]❌  No videos found. Check the channel URL and try again.[/red]")
+        return
+
+    channel_name = channel_name or base.rsplit("/", 1)[-1]
+    chan_dir = Path(output) / sanitize_filename(channel_name, is_id=False)
+    archive  = chan_dir / "downloaded.txt"
+    done_ids = read_archive_ids(archive)
+
+    found   = sum(len(v) for v in tab_entries.values())
+    pending = sum(1 for v in tab_entries.values() for e in v if e.get("id") not in done_ids)
+
+    tbl = Table(show_header=False, box=None, padding=(0, 2))
+    tbl.add_row("[bold]Channel[/bold]",  f"[green]{channel_name}[/green]")
+    for tab, v in tab_entries.items():
+        tbl.add_row(f"[bold]{tab.capitalize()}[/bold]", str(len(v)))
+    tbl.add_row("[bold]Already have[/bold]", str(found - pending))
+    tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]" + ("  (before --since filter)" if since else ""))
+    tbl.add_row("[bold]Quality[/bold]",  quality)
+    tbl.add_row("[bold]Output[/bold]",   str(chan_dir))
+    console.print(tbl)
+    console.print()
+
+    if pending == 0:
+        console.print("[bold green]✅ Already up to date — nothing new to download.[/bold green]")
+        return
+
+    if not yes and not click.confirm("▶  Start download?", default=True):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+
+    chan_dir.mkdir(parents=True, exist_ok=True)
+    errlog = _ErrorLog()
+    downloaded = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[cyan]{task.completed}[/cyan] done"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[green]Starting…", total=None if since else pending)
+
+        def pp_hook(d):
+            if d.get("status") == "finished" and d.get("postprocessor") == "MoveFiles":
+                info_d = d.get("info_dict", {})
+                downloaded.append(info_d.get("id", ""))
+                progress.update(task, advance=1,
+                                description=f"[green]✓ {(info_d.get('title') or '?')[:55]}")
+
+        try:
+            for tab in tab_entries:
+                target = chan_dir / tab if len(tab_entries) > 1 else chan_dir
+                target.mkdir(parents=True, exist_ok=True)
+                tmpl = os.path.join(
+                    str(target).replace("%", "%%"),
+                    "%(upload_date>%Y-%m-%d)s - %(title).150s [%(id)s].%(ext)s",
+                )
+
+                opts = build_ydl_opts(output, quality, True, 1, limit)
+                opts.update({
+                    "outtmpl": tmpl,
+                    "download_archive": str(archive),   # skip anything already downloaded
+                    "retries": 10,
+                    "fragment_retries": 10,
+                    "sleep_interval": 1,                 # be polite on big channels
+                    "max_sleep_interval": 4,
+                    "logger": errlog,
+                    "postprocessor_hooks": [pp_hook],
+                })
+                if since:
+                    opts["dateafter"] = since
+                    opts["breakonreject"] = True         # newest-first, so stop at the cutoff
+
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([f"{base}/{tab}"])
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⏸  Interrupted — re-run the same command to continue "
+                          "(finished videos are skipped).[/yellow]")
+
+    # ── Result summary ────────────────────────────────────────────────────────
+    failed = errlog.errors
+    console.print(
+        f"\n[bold green]✅ Done![/bold green]  "
+        f"[green]{len(downloaded)}[/green] downloaded  •  "
+        f"[red]{len(failed)}[/red] errors"
+    )
+    for msg in failed[:5]:
+        console.print(f"  [red]✗[/red] {msg[:110]}")
+    if len(failed) > 5:
+        console.print(f"  [dim]… and {len(failed) - 5} more[/dim]")
+
+    save_history({
+        "date":       datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "url":        url,
+        "playlist":   f"{channel_name} (channel)",
+        "total":      found,
+        "downloaded": len(downloaded),
+        "failed":     len(failed),
+        "output":     str(chan_dir),
+        "quality":    quality,
+    })
+
+    console.print(f"\n📁  Saved to: [cyan]{chan_dir}[/cyan]")
+    console.print(f"    (Open in Explorer:  [dim]explorer \"{chan_dir}\"[/dim])")
+
+
 # ── info ──────────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -306,7 +517,7 @@ def download(url, output, quality, resume, start, end):
 def info(url):
     """Preview playlist contents without downloading."""
     console.print("[yellow]⏳ Fetching info…[/yellow]")
-    data = fetch_playlist_info(url)
+    data = fetch_playlist_info(resolve_url(url))
 
     if not data:
         console.print("[red]Could not fetch info.[/red]")
