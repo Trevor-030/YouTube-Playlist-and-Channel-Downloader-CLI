@@ -18,7 +18,7 @@ echo [OK] Python found.
 :: Install Python dependencies
 echo.
 echo Installing Python packages...
-pip install yt-dlp rich click --quiet --upgrade
+pip install "yt-dlp[default]" rich click --quiet --upgrade
 if errorlevel 1 (
     echo [ERROR] pip install failed. Check your internet connection.
     pause

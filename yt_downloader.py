@@ -124,6 +124,27 @@ def fetch_playlist_info(url: str) -> dict | None:
             return None
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m|\[[0-9;]*m")
+
+
+def clean_msg(msg: str) -> str:
+    return _ANSI_RE.sub("", msg).strip()
+
+
+def warn_if_no_js_runtime():
+    """YouTube now needs a JS runtime (Deno) for yt-dlp; without it downloads often fail with 403."""
+    import shutil
+    if shutil.which("deno") is None:
+        console.print(Panel(
+            "[bold yellow]Deno (JavaScript runtime) not found.[/bold yellow]\n"
+            "yt-dlp needs it for YouTube; without it you will likely get [red]HTTP 403[/red] errors.\n\n"
+            "  [cyan]winget install DenoLand.Deno[/cyan]   (then restart the terminal)\n"
+            "  [cyan]pip install -U \"yt-dlp\\[default]\"[/cyan]",
+            border_style="yellow",
+        ))
+    console.print(f"[dim]yt-dlp version: {yt_dlp.version.__version__}[/dim]")
+
+
 # ── Channel helpers ────────────────────────────────────────────────────────────
 
 CHANNEL_TABS = ("videos", "shorts", "streams")
@@ -228,7 +249,7 @@ def download(ctx, url, output, quality, resume, start, end):
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
-                          tabs="videos", limit=end, since=None, yes=False)
+                          tabs="videos", limit=end, since=None, browser=None, yes=False)
 
     require_ffmpeg()
 
@@ -361,14 +382,18 @@ def download(ctx, url, output, quality, resume, start, end):
               help="Max videos per tab, newest first  (0 = everything)")
 @click.option("--since", default=None,
               help="Only videos uploaded on/after this date, YYYYMMDD")
+@click.option("--cookies-from-browser", "browser", default=None,
+              type=click.Choice(["chrome", "edge", "firefox", "brave", "opera"]),
+              help="Use your browser's YouTube login (helps with 403 / bot checks)")
 @click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
-def channel(url, output, quality, tabs, limit, since, yes):
+def channel(url, output, quality, tabs, limit, since, browser, yes):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
     (finished videos are tracked in <channel folder>\\downloaded.txt).
     """
     require_ffmpeg()
+    warn_if_no_js_runtime()
 
     cfg = load_config()
     output  = safe_win_path(output or cfg.get("default_output", DEFAULT_OUTPUT))
@@ -473,6 +498,8 @@ def channel(url, output, quality, tabs, limit, since, yes):
                     "logger": errlog,
                     "postprocessor_hooks": [pp_hook],
                 })
+                if browser:
+                    opts["cookiesfrombrowser"] = (browser,)
                 if since:
                     opts["dateafter"] = since
                     opts["breakonreject"] = True         # newest-first, so stop at the cutoff
@@ -484,7 +511,7 @@ def channel(url, output, quality, tabs, limit, since, yes):
                           "(finished videos are skipped).[/yellow]")
 
     # ── Result summary ────────────────────────────────────────────────────────
-    failed = errlog.errors
+    failed = [clean_msg(m) for m in errlog.errors]
     console.print(
         f"\n[bold green]✅ Done![/bold green]  "
         f"[green]{len(downloaded)}[/green] downloaded  •  "
@@ -494,6 +521,13 @@ def channel(url, output, quality, tabs, limit, since, yes):
         console.print(f"  [red]✗[/red] {msg[:110]}")
     if len(failed) > 5:
         console.print(f"  [dim]… and {len(failed) - 5} more[/dim]")
+    if failed and all("403" in m for m in failed):
+        console.print(
+            "\n[yellow]Every error is HTTP 403 — this is YouTube blocking yt-dlp, not your files.[/yellow]\n"
+            "  1. [cyan]pip install -U \"yt-dlp\\[default]\"[/cyan]\n"
+            "  2. [cyan]winget install DenoLand.Deno[/cyan]  (restart terminal)\n"
+            "  3. Retry, adding [cyan]--cookies-from-browser chrome[/cyan] if it persists"
+        )
 
     save_history({
         "date":       datetime.now().strftime("%Y-%m-%d %H:%M"),
