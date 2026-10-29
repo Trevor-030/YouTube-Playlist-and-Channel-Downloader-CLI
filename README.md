@@ -57,6 +57,12 @@ yt download "URL" --start 3 --end 10
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
+:: Re-run the same command any time: finished videos are skipped, broken ones are retried
+:: Unfinished (.part) downloads are retried automatically, 3 extra passes by default
+yt download "URL" --retry-passes 5
+yt download "URL" --retry-passes 0
+yt download "URL" --no-archive
+
 :: Download EVERY video from a channel (@handle, /channel/UC…, /c/… all work)
 yt channel "https://www.youtube.com/@ChannelName"
 yt channel "URL" -q 720p -o "D:\Videos"
@@ -109,10 +115,15 @@ Config is saved to: `%APPDATA%\YTDownloader\config.json`
 ```
 D:\Videos\
 └── Playlist Name\
-    ├── 001 - First Video Title.mp4
-    ├── 002 - Second Video Title.mp4
+    ├── 001 - First Video Title [dQw4w9WgXcQ].mp4
+    ├── 002 - Second Video Title [9bZkp7q19f0].mp4
+    ├── downloaded.txt
     └── ...
 ```
+
+The `[id]` ties every file (and any leftover part) to its video. `downloaded.txt` lists finished
+videos so re-runs only fetch what is missing — delete a line from it to force a re-download.
+Playlist folders made by older versions (names without `[id]`) keep their old naming so nothing downloads twice.
 
 ---
 
@@ -156,6 +167,8 @@ yt history --last 50
 | `ERROR: Unable to download` | Update yt-dlp: `pip install -U yt-dlp` |
 | Filenames look weird | Already handled — Windows-safe filenames enabled |
 | Video has no sound | ffmpeg is missing or not on PATH |
+| "may be cut off" warning after a run | That file is shorter than YouTube says. Delete it and its line in `downloaded.txt`, then re-run |
+| "yt-dlp is N days old" warning | Run `pip install -U "yt-dlp[default]"`. Old versions cause 403s and failed downloads |
 | Separate audio + video files (`name.f137.mp4` + `name.f140.m4a`) | The ffmpeg merge failed. The tool now retries the merge after every download; to fix old folders run `yt repair` |
 | Channel run stops / gets slow | Ctrl+C and re-run the same command; it resumes. Update yt-dlp if YouTube changed |
 | Members-only / private videos | Skipped and listed as errors in the summary |
