@@ -173,7 +173,12 @@ def repair_folder(root: Path) -> tuple:
             console.print(f"  [red]✗[/red] {name} — ffmpeg could not merge it")
             console.print(f"    [dim]{escape(detail)}[/dim]")
         else:
-            console.print(f"  [dim]– {name} — no video + audio pair found[/dim]")
+            waiting = [q for q in incomplete if q.parent == base.parent and q.name.startswith(base.name + ".f")]
+            if waiting:
+                console.print(f"  [yellow]⏳ {name} — one half is still a half-finished .part download; "
+                              f"re-run the same download command to finish it, then it merges[/yellow]")
+            else:
+                console.print(f"  [dim]– {name} — no video + audio pair found[/dim]")
             console.print(f"    [dim]{escape(detail)}[/dim]")
 
     if incomplete:
@@ -334,6 +339,8 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
         "outtmpl": outtmpl,
         "continuedl": resume,
         "concurrent_fragment_downloads": 4,
+        "retries": 10,                 # network drops are what leave .part files behind
+        "fragment_retries": 10,
         "ignoreerrors": True,
         "quiet": True,
         "no_warnings": True,
