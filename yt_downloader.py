@@ -202,12 +202,15 @@ APP_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_OUTPUT = str(Path.home() / "Videos" / "YT Downloads")
 
 # Format strings: prefer pre-merged mp4 stream, then merge with ffmpeg, then any single-file fallback
+# Prefer H.264 video + AAC audio inside each resolution: plays everywhere on Windows and
+# merges into mp4 without codec trouble. Falls back to whatever exists (webm/AV1/Opus).
+FORMAT_SORT = ["res", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]
 QUALITY_OPTIONS = {
-    "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]",
+    "best":  "bv*+ba/b",
+    "1080p": "bv*[height<=1080]+ba/b[height<=1080]",
+    "720p":  "bv*[height<=720]+ba/b[height<=720]",
+    "480p":  "bv*[height<=480]+ba/b[height<=480]",
+    "360p":  "bv*[height<=360]+ba/b[height<=360]",
 }
 
 
@@ -375,6 +378,7 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
 
     opts = {
         "format": fmt,
+        "format_sort": FORMAT_SORT,
         "outtmpl": outtmpl,
         "continuedl": resume,
         "concurrent_fragment_downloads": 4,

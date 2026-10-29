@@ -35,6 +35,14 @@ This installs Python packages and creates a `yt.bat` shortcut so you can just ty
 
 ---
 
+### Optional — install as a command (any OS)
+
+```
+pipx install .
+```
+
+This gives you `yt` everywhere without `setup.bat`. Needs Python 3.10+ and ffmpeg on PATH.
+
 ### Step 3 — Use it
 
 ```bat
@@ -134,6 +142,9 @@ Channel downloads go to `<output>\Channel Name\2024-03-15 - Video Title [id].mp4
 ---
 
 ## 🎛️ Quality Options
+
+Within each resolution the tool prefers H.264 video + AAC audio. It plays everywhere on Windows and
+merges cleanly into mp4. If a video has no such streams, it falls back to the next best (webm / AV1 / Opus).
 
 | Option  | Description               |
 |---------|---------------------------|
