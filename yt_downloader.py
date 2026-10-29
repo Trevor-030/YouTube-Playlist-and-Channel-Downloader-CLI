@@ -21,6 +21,7 @@ from pathlib import Path, WindowsPath
 try:
     import yt_dlp
     from yt_dlp.utils import sanitize_filename
+    from yt_dlp.version import __version__ as YTDLP_VERSION
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn
     from rich.table import Table
@@ -271,6 +272,45 @@ def clean_msg(msg: str) -> str:
     return _ANSI_RE.sub("", msg).strip()
 
 
+def warn_if_old_ytdlp(max_age_days: int = 60):
+    """YouTube changes often; an old yt-dlp is the usual cause of 403s and broken downloads."""
+    try:
+        released = datetime.strptime(".".join(YTDLP_VERSION.split(".")[:3]), "%Y.%m.%d")
+    except ValueError:
+        return
+    age = (datetime.now() - released).days
+    if age > max_age_days:
+        console.print(f"[yellow]⚠ yt-dlp {YTDLP_VERSION} is {age} days old. Update:[/yellow] "
+                      f"[cyan]pip install -U \"yt-dlp\\[default]\"[/cyan]\n")
+
+
+def media_duration(path: Path):
+    """Length in seconds via ffprobe, or None. Probes a short ASCII hard link (emoji names break ffprobe on Windows)."""
+    probe = shutil.which("ffprobe")
+    if not probe or not path.is_file():
+        return None
+    tmp = path.parent / f"_rp_probe{path.suffix}"
+    try:
+        tmp.unlink(missing_ok=True)
+        os.link(path, tmp)
+        r = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", tmp.name],
+            capture_output=True, text=True, errors="replace", cwd=path.parent)
+        return float(r.stdout.strip())
+    except (OSError, ValueError):
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def looks_truncated(path: Path, expected) -> bool:
+    """True if the file is clearly shorter than the length YouTube reports."""
+    if not expected:
+        return False
+    actual = media_duration(path)
+    return actual is not None and actual < expected * 0.95 - 2
+
+
 def warn_if_no_js_runtime():
     """YouTube now needs a JS runtime (Deno) for yt-dlp; without it downloads often fail with 403."""
     import shutil
@@ -382,6 +422,17 @@ def has_legacy_names(folder: Path) -> bool:
                for f in folder.iterdir() if f.is_file())
 
 
+def report_suspect(suspect: list):
+    if not suspect:
+        return
+    console.print(f"\n[yellow]⚠ {len(suspect)} file(s) are shorter than YouTube says — may be cut off:[/yellow]")
+    for n in suspect[:5]:
+        console.print(f"  [dim]{escape(n[:90])}[/dim]")
+    if len(suspect) > 5:
+        console.print(f"  [dim]… and {len(suspect) - 5} more[/dim]")
+    console.print("  Delete the file and its line in downloaded.txt, then re-run the same command.")
+
+
 def run_with_retries(run_pass, scan_dir: Path, passes: int, errlog) -> None:
     """Run one download pass, then keep re-running while half-finished .part files remain.
 
@@ -436,6 +487,7 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
                           retry_passes=retry_passes)
 
     require_ffmpeg()
+    warn_if_old_ytdlp()
 
     cfg = load_config()
     output  = safe_win_path(output  or cfg.get("default_output", DEFAULT_OUTPUT))
@@ -502,6 +554,7 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
         opts["download_archive"] = str(archive_file)
 
     downloaded = []
+    suspect = []        # finished files shorter than YouTube says
     errlog = _ErrorLog()
     _seen_merged = set()
 
@@ -512,6 +565,8 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
             if fpath and fpath not in _seen_merged:
                 _seen_merged.add(fpath)
                 downloaded.append(fpath)
+                if looks_truncated(Path(fpath), d.get("info_dict", {}).get("duration")):
+                    suspect.append(Path(fpath).name)
 
     opts["logger"]              = errlog   # keep download/merge errors instead of hiding them
     opts["postprocessor_hooks"] = [postprocessor_hook]
@@ -544,7 +599,11 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
                 except Exception as e:
                     console.print(f"[red]Download error: {e}[/red]")
 
-        run_with_retries(one_pass, folder, retry_passes, errlog)
+        try:
+            run_with_retries(one_pass, folder, retry_passes, errlog)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⏸  Interrupted — re-run the same command to continue "
+                          "(finished videos are skipped, half-done ones resume).[/yellow]")
 
     # ── Fix any video/audio files ffmpeg failed to merge ──────────────────────
     repair_folder(folder)
@@ -573,6 +632,8 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
         "output":     output,
         "quality":    quality,
     })
+
+    report_suspect(suspect)
 
     console.print(f"\n📁  Saved to: [cyan]{output}[/cyan]")
     console.print(f"    (Open in Explorer:  [dim]explorer \"{output}\"[/dim])")
@@ -606,6 +667,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
     (finished videos are tracked in <channel folder>\\downloaded.txt).
     """
     require_ffmpeg()
+    warn_if_old_ytdlp()
     warn_if_no_js_runtime()
 
     cfg = load_config()
@@ -673,6 +735,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
     chan_dir.mkdir(parents=True, exist_ok=True)
     errlog = _ErrorLog()
     downloaded = []
+    suspect = []        # finished files shorter than YouTube says
 
     with Progress(
         SpinnerColumn(),
@@ -688,6 +751,9 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
             if d.get("status") == "finished" and d.get("postprocessor") == "MoveFiles":
                 info_d = d.get("info_dict", {})
                 downloaded.append(info_d.get("id", ""))
+                fpath = info_d.get("filepath") or d.get("filepath")
+                if fpath and looks_truncated(Path(fpath), info_d.get("duration")):
+                    suspect.append(Path(fpath).name)
                 progress.update(task, advance=1,
                                 description=f"[green]✓ {(info_d.get('title') or '?')[:55]}")
 
@@ -758,6 +824,8 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
         "output":     str(chan_dir),
         "quality":    quality,
     })
+
+    report_suspect(suspect)
 
     console.print(f"\n📁  Saved to: [cyan]{chan_dir}[/cyan]")
     console.print(f"    (Open in Explorer:  [dim]explorer \"{chan_dir}\"[/dim])")
