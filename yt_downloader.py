@@ -12,6 +12,7 @@ import re
 import json
 import sys
 import shutil
+import subprocess
 import click
 from datetime import datetime
 from pathlib import Path, WindowsPath
@@ -24,6 +25,7 @@ try:
     from rich.table import Table
     from rich.panel import Panel
     from rich.prompt import Prompt
+    from rich.markup import escape
 except ImportError:
     print("Missing dependencies. Run:  pip install yt-dlp rich click")
     sys.exit(1)
@@ -50,6 +52,94 @@ def require_ffmpeg():
             border_style="red",
         ))
         raise SystemExit(1)
+
+
+# ── Repair: merge leftover video/audio parts ───────────────────────────────────
+# yt-dlp downloads video and audio as separate files (name.f137.mp4 + name.f140.m4a)
+# and merges them with ffmpeg. If the merge fails, those parts are left behind.
+
+_PART_RE = re.compile(r"^(?P<base>.+)\.f\d+\.[A-Za-z0-9]+$")
+
+
+def find_split_files(root: Path) -> dict:
+    """Group leftover  <name>.fNNN.<ext>  files by <name>."""
+    groups = {}
+    for p in Path(root).rglob("*"):
+        m = _PART_RE.match(p.name)
+        if m and p.is_file():
+            groups.setdefault(p.parent / m["base"], []).append(p)
+    return groups
+
+
+def _stream_kinds(path: Path) -> set:
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return set()
+    r = subprocess.run(
+        [probe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    return set(r.stdout.split())
+
+
+def _ffmpeg_merge(video: Path, audio: Path, out: Path, audio_args: list) -> bool:
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
+           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args,
+           "-movflags", "+faststart", str(out)]
+    ok = subprocess.run(cmd, capture_output=True).returncode == 0
+    return ok and out.exists() and out.stat().st_size > 0
+
+
+def merge_group(base: Path, parts: list) -> str:
+    """Merge one video's parts. Returns 'merged', 'exists', 'failed' or 'skipped'."""
+    kinds = {p: _stream_kinds(p) for p in parts}
+    video = next((p for p, k in kinds.items() if "video" in k and "audio" not in k), None)
+    audio = next((p for p, k in kinds.items() if "audio" in k and "video" not in k), None)
+    if not video or not audio:
+        return "skipped"
+
+    target = base.parent / f"{base.name}.mp4"
+    if target.exists():
+        return "exists"
+
+    tmp = base.parent / f"{base.name}.repair.mp4"
+    # Try a lossless copy first; re-encode audio to AAC if the container rejects it (e.g. Opus in mp4)
+    ok = (_ffmpeg_merge(video, audio, tmp, ["-c:a", "copy"]) or
+          _ffmpeg_merge(video, audio, tmp, ["-c:a", "aac", "-b:a", "192k"]))
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        return "failed"
+
+    tmp.replace(target)
+    for p in parts:
+        p.unlink(missing_ok=True)
+    return "merged"
+
+
+def repair_folder(root: Path) -> tuple:
+    """Find and merge split video/audio files under root. Returns (found, fixed)."""
+    if not shutil.which("ffprobe"):
+        console.print("[yellow]ffprobe not found (it ships with ffmpeg) — cannot check for split files.[/yellow]")
+        return 0, 0
+
+    groups = find_split_files(root)
+    if not groups:
+        return 0, 0
+
+    console.print(f"\n[yellow]🔧 {len(groups)} video(s) came out as separate audio + video files — merging…[/yellow]")
+    fixed = 0
+    for base, parts in sorted(groups.items()):
+        name = escape(base.name[:60])
+        result = merge_group(base, parts)
+        if result == "merged":
+            fixed += 1
+            console.print(f"  [green]✓[/green] {name}")
+        elif result == "exists":
+            console.print(f"  [yellow]•[/yellow] {name} — merged .mp4 already exists; leftover parts can be deleted")
+        elif result == "failed":
+            console.print(f"  [red]✗[/red] {name} — ffmpeg could not merge it (try: pip install -U yt-dlp, update ffmpeg)")
+        else:
+            console.print(f"  [dim]– {name} — no video + audio pair found[/dim]")
+    return len(groups), fixed
 
 
 # ── Config & history stored in %APPDATA%\YTDownloader ──────────────────────────
@@ -191,8 +281,8 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
     # Windows-safe output template (avoids illegal filename chars)
     outtmpl = os.path.join(
         output_dir,
-        "%(playlist_title)s",
-        "%(playlist_index)03d - %(title)s.%(ext)s",
+        "%(playlist_title).80s",
+        "%(playlist_index)03d - %(title).100s.%(ext)s",
     )
 
     opts = {
@@ -293,13 +383,9 @@ def download(ctx, url, output, quality, resume, start, end):
     Path(output).mkdir(parents=True, exist_ok=True)
     opts = build_ydl_opts(output, quality, resume, start, end)
 
-    downloaded, failed = [], []
+    downloaded = []
+    errlog = _ErrorLog()
     _seen_merged = set()
-
-    def progress_hook(d):
-        # Only track errors here; counting is done in postprocessor_hook
-        if d["status"] == "error":
-            failed.append(d.get("filename", "unknown"))
 
     def postprocessor_hook(d):
         """Fires once per video after ffmpeg merges streams — correct count."""
@@ -309,7 +395,7 @@ def download(ctx, url, output, quality, resume, start, end):
                 _seen_merged.add(fpath)
                 downloaded.append(fpath)
 
-    opts["progress_hooks"]      = [progress_hook]
+    opts["logger"]              = errlog   # keep download/merge errors instead of hiding them
     opts["postprocessor_hooks"] = [postprocessor_hook]
 
     with Progress(
@@ -339,7 +425,11 @@ def download(ctx, url, output, quality, resume, start, end):
             except Exception as e:
                 console.print(f"[red]Download error: {e}[/red]")
 
+    # ── Fix any video/audio files ffmpeg failed to merge ──────────────────────
+    repair_folder(Path(output))
+
     # ── Result summary ────────────────────────────────────────────────────────
+    failed = [clean_msg(m) for m in errlog.errors]
     console.print(
         f"\n[bold green]✅ Done![/bold green]  "
         f"[green]{len(downloaded)}[/green] downloaded  •  "
@@ -348,7 +438,7 @@ def download(ctx, url, output, quality, resume, start, end):
 
     if failed:
         for f in failed[:5]:
-            console.print(f"  [red]✗[/red] {f}")
+            console.print(f"  [red]✗[/red] {escape(f[:110])}")
         if len(failed) > 5:
             console.print(f"  [dim]… and {len(failed)-5} more[/dim]")
 
@@ -484,7 +574,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes):
                 target.mkdir(parents=True, exist_ok=True)
                 tmpl = os.path.join(
                     str(target).replace("%", "%%"),
-                    "%(upload_date>%Y-%m-%d)s - %(title).150s [%(id)s].%(ext)s",
+                    "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
                 )
 
                 opts = build_ydl_opts(output, quality, True, 1, limit)
@@ -510,6 +600,9 @@ def channel(url, output, quality, tabs, limit, since, browser, yes):
             console.print("\n[yellow]⏸  Interrupted — re-run the same command to continue "
                           "(finished videos are skipped).[/yellow]")
 
+    # ── Fix any video/audio files ffmpeg failed to merge ──────────────────────
+    repair_folder(chan_dir)
+
     # ── Result summary ────────────────────────────────────────────────────────
     failed = [clean_msg(m) for m in errlog.errors]
     console.print(
@@ -518,7 +611,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes):
         f"[red]{len(failed)}[/red] errors"
     )
     for msg in failed[:5]:
-        console.print(f"  [red]✗[/red] {msg[:110]}")
+        console.print(f"  [red]✗[/red] {escape(msg[:110])}")
     if len(failed) > 5:
         console.print(f"  [dim]… and {len(failed) - 5} more[/dim]")
     if failed and all("403" in m for m in failed):
@@ -573,6 +666,30 @@ def info(url):
     console.print(tbl)
     if len(entries) > 60:
         console.print(f"[dim]… and {len(entries)-60} more videos[/dim]")
+
+
+# ── repair ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("folder", required=False)
+def repair(folder):
+    """Merge leftover video + audio files (name.f137.mp4 + name.f140.m4a) into one .mp4.
+
+    FOLDER defaults to your configured output folder. Searches subfolders too.
+    """
+    require_ffmpeg()
+    cfg = load_config()
+    root = Path(safe_win_path(folder or cfg.get("default_output", DEFAULT_OUTPUT)))
+    if not root.is_dir():
+        console.print(f"[red]Folder not found: {escape(str(root))}[/red]")
+        return
+
+    console.print(f"[yellow]⏳ Scanning {escape(str(root))}…[/yellow]")
+    found, fixed = repair_folder(root)
+    if found == 0:
+        console.print("[green]✅ No split files found.[/green]")
+    else:
+        console.print(f"\n[bold green]Done![/bold green]  {fixed}/{found} merged.")
 
 
 # ── history ───────────────────────────────────────────────────────────────────
