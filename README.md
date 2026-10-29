@@ -75,6 +75,10 @@ yt download "https://www.youtube.com/@ChannelName"
 :: Preview playlist (or channel) contents without downloading
 yt info "URL"
 
+:: Fix videos that came out as separate audio + video files
+yt repair
+yt repair "D:\Videos"
+
 :: View download history
 yt history
 
@@ -152,5 +156,6 @@ yt history --last 50
 | `ERROR: Unable to download` | Update yt-dlp: `pip install -U yt-dlp` |
 | Filenames look weird | Already handled — Windows-safe filenames enabled |
 | Video has no sound | ffmpeg is missing or not on PATH |
+| Separate audio + video files (`name.f137.mp4` + `name.f140.m4a`) | The ffmpeg merge failed. The tool now retries the merge after every download; to fix old folders run `yt repair` |
 | Channel run stops / gets slow | Ctrl+C and re-run the same command; it resumes. Update yt-dlp if YouTube changed |
 | Members-only / private videos | Skipped and listed as errors in the summary |
