@@ -13,6 +13,7 @@ import json
 import sys
 import shutil
 import subprocess
+import time
 import click
 from datetime import datetime
 from pathlib import Path, WindowsPath
@@ -324,15 +325,13 @@ def read_archive_ids(archive: Path) -> set:
 
 
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
-                   playlist_start: int, playlist_end: int) -> dict:
+                   playlist_start: int, playlist_end: int, id_in_name: bool = True) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
 
     # Windows-safe output template (avoids illegal filename chars)
-    outtmpl = os.path.join(
-        output_dir,
-        "%(playlist_title).80s",
-        "%(playlist_index)03d - %(title).100s.%(ext)s",
-    )
+    # The video id in the name ties every leftover file to its video (and survives title changes)
+    name = "%(playlist_index)03d - %(title).100s" + (" [%(id)s]" if id_in_name else "") + ".%(ext)s"
+    outtmpl = os.path.join(output_dir.replace("%", "%%"), "%(playlist_title).80s", name)
 
     opts = {
         "format": fmt,
@@ -360,6 +359,45 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
     return opts
 
 
+# ── Playlist layout, archive & auto-retry ──────────────────────────────────────
+
+AUTO_PASSES = 3                      # extra passes to finish .part downloads automatically
+_ID_TAG = re.compile(r"\[[A-Za-z0-9_-]{11}\](\.|$)")
+
+
+def playlist_folder(opts: dict, info: dict, title: str) -> Path:
+    """Ask yt-dlp itself where this playlist's files will go (same sanitising as a real download)."""
+    probe = {"id": "x", "title": "t", "ext": "mp4"}
+    if info.get("entries"):
+        probe.update(playlist_title=title, playlist_index=1)
+    with yt_dlp.YoutubeDL({**opts, "quiet": True, "logger": None}) as y:
+        return Path(os.path.dirname(y.prepare_filename(probe)))
+
+
+def has_legacy_names(folder: Path) -> bool:
+    """True if the folder holds numbered files that were saved without a [video id]."""
+    if not folder.is_dir():
+        return False
+    return any(re.match(r"\d+ - ", f.name) and not _ID_TAG.search(f.name)
+               for f in folder.iterdir() if f.is_file())
+
+
+def run_with_retries(run_pass, scan_dir: Path, passes: int, errlog) -> None:
+    """Run one download pass, then keep re-running while half-finished .part files remain.
+
+    Finished videos are skipped (archive) and .part files resume, so each extra pass is cheap.
+    """
+    run_pass()
+    for n in range(1, passes + 1):
+        left = find_incomplete(scan_dir)
+        if not left:
+            return
+        console.print(f"\n[yellow]↻ {len(left)} unfinished download(s) — retry pass {n}/{passes}…[/yellow]")
+        time.sleep(5)
+        errlog.errors.clear()        # only report errors that survive the last pass
+        run_pass()
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -383,14 +421,19 @@ def cli():
               help="Start from this playlist index")
 @click.option("--end", default=0, show_default=True,
               help="End at this playlist index  (0 = all)")
+@click.option("--archive/--no-archive", default=True, show_default=True,
+              help="Remember finished videos (downloaded.txt) so re-runs only touch what is missing")
+@click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
+              help="Extra automatic passes to finish unfinished downloads  (0 = off)")
 @click.pass_context
-def download(ctx, url, output, quality, resume, start, end):
+def download(ctx, url, output, quality, resume, start, end, archive, retry_passes):
     """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
 
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
-                          tabs="videos", limit=end, since=None, browser=None, yes=False)
+                          tabs="videos", limit=end, since=None, browser=None, yes=False,
+                          retry_passes=retry_passes)
 
     require_ffmpeg()
 
@@ -412,12 +455,27 @@ def download(ctx, url, output, quality, resume, start, end):
 
     title   = info.get("title", "Unknown Playlist")
     entries = info.get("entries") or [info]
-    total   = len([e for e in entries if e])   # skip None entries
+    entries = [e for e in entries if e]        # skip None entries
+    entries = entries[max(start, 1) - 1:(end or None)]
+    total   = len(entries)
+
+    # Where files go, naming style, and which videos are already finished
+    opts   = build_ydl_opts(output, quality, resume, start, end)
+    folder = playlist_folder(opts, info, title)
+    legacy = has_legacy_names(folder)
+    if legacy:   # older downloads have no [id] in the name — keep that so nothing downloads twice
+        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False)
+    archive_file = folder / "downloaded.txt"
+    done_ids = read_archive_ids(archive_file) if archive else set()
+    pending  = sum(1 for e in entries if e.get("id") not in done_ids)
 
     # Summary panel
     tbl = Table(show_header=False, box=None, padding=(0, 2))
     tbl.add_row("[bold]Playlist[/bold]",  f"[green]{title}[/green]")
     tbl.add_row("[bold]Videos[/bold]",    str(total))
+    if archive:
+        tbl.add_row("[bold]Already have[/bold]", str(total - pending))
+        tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]")
     tbl.add_row("[bold]Quality[/bold]",   quality)
     tbl.add_row("[bold]Output[/bold]",    output)
     tbl.add_row("[bold]Resume[/bold]",    "✔ Yes" if resume else "✘ No")
@@ -427,12 +485,21 @@ def download(ctx, url, output, quality, resume, start, end):
     console.print(tbl)
     console.print()
 
+    if legacy:
+        console.print("[dim]ℹ Files in this folder use the old naming (no video id) — keeping it so nothing downloads twice.[/dim]\n")
+
+    if archive and pending == 0:
+        repair_folder(folder)
+        console.print("[bold green]✅ Already up to date — nothing left to download.[/bold green]")
+        return
+
     if not click.confirm("▶  Start download?", default=True):
         console.print("[yellow]Aborted.[/yellow]")
         return
 
     Path(output).mkdir(parents=True, exist_ok=True)
-    opts = build_ydl_opts(output, quality, resume, start, end)
+    if archive:
+        opts["download_archive"] = str(archive_file)
 
     downloaded = []
     errlog = _ErrorLog()
@@ -457,7 +524,7 @@ def download(ctx, url, output, quality, resume, start, end):
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("[green]Downloading…", total=total)
+        task = progress.add_task("[green]Downloading…", total=pending if archive else total)
 
         base_pp_hook = opts["postprocessor_hooks"][0]
 
@@ -470,14 +537,17 @@ def download(ctx, url, output, quality, resume, start, end):
 
         opts["postprocessor_hooks"] = [rich_pp_hook]
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                ydl.download([url])
-            except Exception as e:
-                console.print(f"[red]Download error: {e}[/red]")
+        def one_pass():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                try:
+                    ydl.download([url])
+                except Exception as e:
+                    console.print(f"[red]Download error: {e}[/red]")
+
+        run_with_retries(one_pass, folder, retry_passes, errlog)
 
     # ── Fix any video/audio files ffmpeg failed to merge ──────────────────────
-    repair_folder(Path(output))
+    repair_folder(folder)
 
     # ── Result summary ────────────────────────────────────────────────────────
     failed = [clean_msg(m) for m in errlog.errors]
@@ -527,7 +597,9 @@ def download(ctx, url, output, quality, resume, start, end):
               type=click.Choice(["chrome", "edge", "firefox", "brave", "opera"]),
               help="Use your browser's YouTube login (helps with 403 / bot checks)")
 @click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
-def channel(url, output, quality, tabs, limit, since, browser, yes):
+@click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
+              help="Extra automatic passes to finish unfinished downloads  (0 = off)")
+def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
@@ -619,34 +691,37 @@ def channel(url, output, quality, tabs, limit, since, browser, yes):
                 progress.update(task, advance=1,
                                 description=f"[green]✓ {(info_d.get('title') or '?')[:55]}")
 
+        def one_pass():
+                for tab in tab_entries:
+                    target = chan_dir / tab if len(tab_entries) > 1 else chan_dir
+                    target.mkdir(parents=True, exist_ok=True)
+                    tmpl = os.path.join(
+                        str(target).replace("%", "%%"),
+                        "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
+                    )
+
+                    opts = build_ydl_opts(output, quality, True, 1, limit)
+                    opts.update({
+                        "outtmpl": tmpl,
+                        "download_archive": str(archive),   # skip anything already downloaded
+                        "retries": 10,
+                        "fragment_retries": 10,
+                        "sleep_interval": 1,                 # be polite on big channels
+                        "max_sleep_interval": 4,
+                        "logger": errlog,
+                        "postprocessor_hooks": [pp_hook],
+                    })
+                    if browser:
+                        opts["cookiesfrombrowser"] = (browser,)
+                    if since:
+                        opts["dateafter"] = since
+                        opts["breakonreject"] = True         # newest-first, so stop at the cutoff
+
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([f"{base}/{tab}"])
+
         try:
-            for tab in tab_entries:
-                target = chan_dir / tab if len(tab_entries) > 1 else chan_dir
-                target.mkdir(parents=True, exist_ok=True)
-                tmpl = os.path.join(
-                    str(target).replace("%", "%%"),
-                    "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
-                )
-
-                opts = build_ydl_opts(output, quality, True, 1, limit)
-                opts.update({
-                    "outtmpl": tmpl,
-                    "download_archive": str(archive),   # skip anything already downloaded
-                    "retries": 10,
-                    "fragment_retries": 10,
-                    "sleep_interval": 1,                 # be polite on big channels
-                    "max_sleep_interval": 4,
-                    "logger": errlog,
-                    "postprocessor_hooks": [pp_hook],
-                })
-                if browser:
-                    opts["cookiesfrombrowser"] = (browser,)
-                if since:
-                    opts["dateafter"] = since
-                    opts["breakonreject"] = True         # newest-first, so stop at the cutoff
-
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([f"{base}/{tab}"])
+            run_with_retries(one_pass, chan_dir, retry_passes, errlog)
         except KeyboardInterrupt:
             console.print("\n[yellow]⏸  Interrupted — re-run the same command to continue "
                           "(finished videos are skipped).[/yellow]")
