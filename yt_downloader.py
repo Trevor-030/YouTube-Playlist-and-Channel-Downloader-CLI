@@ -58,7 +58,10 @@ def require_ffmpeg():
 # yt-dlp downloads video and audio as separate files (name.f137.mp4 + name.f140.m4a)
 # and merges them with ffmpeg. If the merge fails, those parts are left behind.
 
-_PART_RE = re.compile(r"^(?P<base>.+)\.f\d+\.[A-Za-z0-9]+$")
+# name.f137.mp4 / name.f251.webm / name.f251-drc.webm / name.f140-1.m4a
+_PART_RE = re.compile(r"^(?P<base>.+)\.f(?P<itag>\d+)(?:-[A-Za-z0-9]+)*\.(?P<ext>[A-Za-z0-9]+)$")
+_AUDIO_EXTS  = {"m4a", "mp3", "opus", "aac", "ogg", "oga", "wav", "flac"}
+_AUDIO_ITAGS = {"139", "140", "141", "249", "250", "251", "256", "258", "325", "327", "328", "338", "599", "600"}
 
 
 def find_split_files(root: Path) -> dict:
@@ -71,75 +74,116 @@ def find_split_files(root: Path) -> dict:
     return groups
 
 
-def _stream_kinds(path: Path) -> set:
+def find_incomplete(root: Path) -> list:
+    """Half-downloaded files (.part / .ytdl) — these need the download re-run, not a merge."""
+    return [p for p in Path(root).rglob("*") if p.is_file() and p.suffix in (".part", ".ytdl")]
+
+
+def _guess_kinds(path: Path) -> set:
+    """Fallback when ffprobe can't tell: judge by extension / YouTube format id."""
+    m = _PART_RE.match(path.name)
+    if m and (m["ext"].lower() in _AUDIO_EXTS or m["itag"] in _AUDIO_ITAGS):
+        return {"audio"}
+    return {"video"}
+
+
+def _probe_kinds(path: Path) -> set:
     probe = shutil.which("ffprobe")
     if not probe:
         return set()
     r = subprocess.run(
-        [probe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True)
+        [probe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path.name],
+        capture_output=True, text=True, errors="replace", cwd=path.parent)
     return set(r.stdout.split())
 
 
-def _ffmpeg_merge(video: Path, audio: Path, out: Path, audio_args: list) -> bool:
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio),
+def _ffmpeg_merge(video: Path, audio: Path, out: Path, audio_args: list) -> tuple:
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", video.name, "-i", audio.name,
            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args,
-           "-movflags", "+faststart", str(out)]
-    ok = subprocess.run(cmd, capture_output=True).returncode == 0
-    return ok and out.exists() and out.stat().st_size > 0
+           "-movflags", "+faststart", out.name]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", cwd=out.parent)
+    ok = r.returncode == 0 and out.exists() and out.stat().st_size > 0
+    return ok, r.stderr.strip()
 
 
-def merge_group(base: Path, parts: list) -> str:
-    """Merge one video's parts. Returns 'merged', 'exists', 'failed' or 'skipped'."""
-    kinds = {p: _stream_kinds(p) for p in parts}
-    video = next((p for p, k in kinds.items() if "video" in k and "audio" not in k), None)
-    audio = next((p for p, k in kinds.items() if "audio" in k and "video" not in k), None)
-    if not video or not audio:
-        return "skipped"
+def merge_group(base: Path, parts: list) -> tuple:
+    """Merge one video's parts. Returns (status, detail); status is merged/exists/failed/skipped.
 
-    target = base.parent / f"{base.name}.mp4"
+    ffmpeg/ffprobe only ever see short ASCII temp names (emoji, accents and very long
+    titles in file names break them on Windows); the real names are restored afterwards.
+    """
+    folder = base.parent
+    target = folder / f"{base.name}.mp4"
     if target.exists():
-        return "exists"
+        return "exists", ""
 
-    tmp = base.parent / f"{base.name}.repair.mp4"
-    # Try a lossless copy first; re-encode audio to AAC if the container rejects it (e.g. Opus in mp4)
-    ok = (_ffmpeg_merge(video, audio, tmp, ["-c:a", "copy"]) or
-          _ffmpeg_merge(video, audio, tmp, ["-c:a", "aac", "-b:a", "192k"]))
-    if not ok:
-        tmp.unlink(missing_ok=True)
-        return "failed"
+    moved = []          # (temp path, original path)
+    out = folder / "_rp_out.mp4"
+    status, detail = "skipped", ""
+    try:
+        for i, p in enumerate(parts):
+            t = folder / f"_rp{i}{p.suffix}"
+            p.rename(t)
+            moved.append((t, p))
 
-    tmp.replace(target)
-    for p in parts:
-        p.unlink(missing_ok=True)
-    return "merged"
+        kinds = {t: (_probe_kinds(t) or _guess_kinds(orig)) for t, orig in moved}
+        detail = ", ".join(f"{orig.name[-28:]} → {'+'.join(sorted(kinds[t]))}" for t, orig in moved)
+        video = next((t for t in kinds if "video" in kinds[t] and "audio" not in kinds[t]), None)
+        audio = next((t for t in kinds if "audio" in kinds[t] and "video" not in kinds[t]), None)
+
+        if video and audio:
+            ok, err = _ffmpeg_merge(video, audio, out, ["-c:a", "copy"])
+            if not ok:   # e.g. Opus audio can't go into mp4 — re-encode just the audio
+                ok, err = _ffmpeg_merge(video, audio, out, ["-c:a", "aac", "-b:a", "192k"])
+            if ok:
+                out.replace(target)
+                for t, _ in moved:
+                    t.unlink(missing_ok=True)
+                moved = []
+                status = "merged"
+            else:
+                status, detail = "failed", err[-200:]
+    finally:
+        out.unlink(missing_ok=True)
+        for t, orig in moved:           # not merged → put the original names back
+            if t.exists():
+                t.rename(orig)
+    return status, detail
 
 
 def repair_folder(root: Path) -> tuple:
-    """Find and merge split video/audio files under root. Returns (found, fixed)."""
-    if not shutil.which("ffprobe"):
-        console.print("[yellow]ffprobe not found (it ships with ffmpeg) — cannot check for split files.[/yellow]")
-        return 0, 0
-
+    """Find and merge split video/audio files under root. Returns (found, fixed, incomplete)."""
     groups = find_split_files(root)
-    if not groups:
-        return 0, 0
+    incomplete = find_incomplete(root)
+    if not groups and not incomplete:
+        return 0, 0, 0
 
-    console.print(f"\n[yellow]🔧 {len(groups)} video(s) came out as separate audio + video files — merging…[/yellow]")
     fixed = 0
+    if groups:
+        console.print(f"\n[yellow]🔧 {len(groups)} video(s) came out as separate audio + video files — merging…[/yellow]")
     for base, parts in sorted(groups.items()):
         name = escape(base.name[:60])
-        result = merge_group(base, parts)
-        if result == "merged":
+        status, detail = merge_group(base, parts)
+        if status == "merged":
             fixed += 1
             console.print(f"  [green]✓[/green] {name}")
-        elif result == "exists":
+        elif status == "exists":
             console.print(f"  [yellow]•[/yellow] {name} — merged .mp4 already exists; leftover parts can be deleted")
-        elif result == "failed":
-            console.print(f"  [red]✗[/red] {name} — ffmpeg could not merge it (try: pip install -U yt-dlp, update ffmpeg)")
+        elif status == "failed":
+            console.print(f"  [red]✗[/red] {name} — ffmpeg could not merge it")
+            console.print(f"    [dim]{escape(detail)}[/dim]")
         else:
             console.print(f"  [dim]– {name} — no video + audio pair found[/dim]")
-    return len(groups), fixed
+            console.print(f"    [dim]{escape(detail)}[/dim]")
+
+    if incomplete:
+        console.print(f"\n[yellow]⚠ {len(incomplete)} incomplete download(s) (.part/.ytdl) — "
+                      f"re-run the same download command to finish them:[/yellow]")
+        for p in incomplete[:5]:
+            console.print(f"  [dim]{escape(p.name[:80])}[/dim]")
+        if len(incomplete) > 5:
+            console.print(f"  [dim]… and {len(incomplete) - 5} more[/dim]")
+    return len(groups), fixed, len(incomplete)
 
 
 # ── Config & history stored in %APPDATA%\YTDownloader ──────────────────────────
@@ -685,10 +729,10 @@ def repair(folder):
         return
 
     console.print(f"[yellow]⏳ Scanning {escape(str(root))}…[/yellow]")
-    found, fixed = repair_folder(root)
-    if found == 0:
-        console.print("[green]✅ No split files found.[/green]")
-    else:
+    found, fixed, incomplete = repair_folder(root)
+    if found == 0 and incomplete == 0:
+        console.print("[green]✅ No split or incomplete files found.[/green]")
+    elif found:
         console.print(f"\n[bold green]Done![/bold green]  {fixed}/{found} merged.")
 
 
