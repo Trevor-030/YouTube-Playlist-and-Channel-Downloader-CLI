@@ -370,9 +370,15 @@ def read_archive_ids(archive: Path) -> set:
 AUDIO_FORMATS = ("mp3", "m4a")
 
 
+def parse_langs(value):
+    """'en, fr' -> ['en', 'fr'];  None/'' -> None."""
+    langs = [l.strip() for l in (value or "").split(",") if l.strip()]
+    return langs or None
+
+
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
                    playlist_start: int, playlist_end: int, id_in_name: bool = True,
-                   audio: str = None) -> dict:
+                   audio: str = None, subs: list = None) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
 
     # Windows-safe output template (avoids illegal filename chars)
@@ -407,6 +413,19 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
         opts["format"] = "bestaudio[ext=m4a]/bestaudio/best" if audio == "m4a" else "bestaudio/best"
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": audio,
                                    "preferredquality": "192"}]
+
+    if subs:
+        # Real captions first; YouTube's auto-generated ones only where no real captions exist.
+        # Saved beside the video as  <name>.<lang>.srt
+        opts.update({
+            "writesubtitles": True,
+            "writeautomaticsub": subs != ["all"],     # 'all' would pull dozens of auto translations
+            "subtitleslangs": subs,
+            "subtitlesformat": "srt/vtt/best",
+            "sleep_interval_subtitles": 1,            # YouTube rate-limits caption requests
+        })
+        opts.setdefault("postprocessors", []).append(
+            {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
 
     if playlist_start > 1:
         opts["playliststart"] = playlist_start
@@ -493,17 +512,19 @@ def cli():
               help="Remember finished videos (downloaded.txt) so re-runs only touch what is missing")
 @click.option("--audio", type=click.Choice(AUDIO_FORMATS), default=None,
               help="Audio only: save as mp3 or m4a instead of video (own '(audio)' folder)")
+@click.option("--subs", default=None, metavar="LANGS",
+              help="Also save subtitles, e.g. --subs en  or  --subs en,fr  (real captions, else auto-generated)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
 @click.pass_context
-def download(ctx, url, output, quality, resume, start, end, archive, audio, retry_passes):
+def download(ctx, url, output, quality, resume, start, end, archive, audio, subs, retry_passes):
     """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
 
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
                           tabs="videos", limit=end, since=None, browser=None, yes=False,
-                          retry_passes=retry_passes, audio=audio)
+                          retry_passes=retry_passes, audio=audio, subs=subs)
 
     require_ffmpeg()
     warn_if_old_ytdlp()
@@ -531,11 +552,12 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, retr
     total   = len(entries)
 
     # Where files go, naming style, and which videos are already finished
-    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio)
+    langs  = parse_langs(subs)
+    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio, subs=langs)
     folder = playlist_folder(opts, info, title)
     legacy = has_legacy_names(folder)
     if legacy:   # older downloads have no [id] in the name — keep that so nothing downloads twice
-        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio)
+        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio, subs=langs)
     archive_file = folder / "downloaded.txt"
     done_ids = read_archive_ids(archive_file) if archive else set()
     pending  = sum(1 for e in entries if e.get("id") not in done_ids)
@@ -548,6 +570,8 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, retr
         tbl.add_row("[bold]Already have[/bold]", str(total - pending))
         tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]")
     tbl.add_row("[bold]Quality[/bold]",   f"audio only ({audio})" if audio else quality)
+    if langs:
+        tbl.add_row("[bold]Subtitles[/bold]", ", ".join(langs))
     tbl.add_row("[bold]Output[/bold]",    output)
     tbl.add_row("[bold]Resume[/bold]",    "✔ Yes" if resume else "✘ No")
     if start > 1 or end > 0:
@@ -679,9 +703,11 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, retr
 @click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
 @click.option("--audio", type=click.Choice(AUDIO_FORMATS), default=None,
               help="Audio only: save as mp3 or m4a instead of video (own '(audio)' folder)")
+@click.option("--subs", default=None, metavar="LANGS",
+              help="Also save subtitles, e.g. --subs en  or  --subs en,fr  (real captions, else auto-generated)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
-def channel(url, output, quality, tabs, limit, since, browser, yes, audio, retry_passes):
+def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs, retry_passes):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
@@ -741,6 +767,9 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, retry
     tbl.add_row("[bold]Already have[/bold]", str(found - pending))
     tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]" + ("  (before --since filter)" if since else ""))
     tbl.add_row("[bold]Quality[/bold]",  f"audio only ({audio})" if audio else quality)
+    langs = parse_langs(subs)
+    if langs:
+        tbl.add_row("[bold]Subtitles[/bold]", ", ".join(langs))
     tbl.add_row("[bold]Output[/bold]",   str(chan_dir))
     console.print(tbl)
     console.print()
@@ -787,7 +816,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, retry
                         "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
                     )
 
-                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio)
+                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio, subs=langs)
                     opts.update({
                         "outtmpl": tmpl,
                         "download_archive": str(archive),   # skip anything already downloaded

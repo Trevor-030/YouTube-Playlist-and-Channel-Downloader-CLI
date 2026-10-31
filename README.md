@@ -66,6 +66,10 @@ yt download "URL" --start 3 --end 10
 yt download "URL" --audio mp3
 yt channel "URL" --audio m4a
 
+:: Also save subtitles as .srt beside each video (real captions, else auto-generated)
+yt download "URL" --subs en
+yt download "URL" --subs en,fr
+
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
@@ -145,6 +149,13 @@ Playlist folders made by older versions (names without `[id]`) keep their old na
 Channel downloads go to `<output>\Channel Name\2024-03-15 - Video Title [id].mp4`
 (with `--tabs all`, each tab gets its own subfolder). Finished videos are logged in
 `<output>\Channel Name\downloaded.txt`, which is what makes re-runs skip what you already have.
+
+---
+
+### Subtitles on videos you already have
+
+Finished videos are skipped, so `--subs` only applies to new ones. To add subtitles to old downloads,
+delete that folder's `downloaded.txt` and re-run with `--subs en`. Videos already on disk are not downloaded again.
 
 ---
 
