@@ -9,6 +9,7 @@ Requirements:
 
 import os
 import re
+import importlib.util
 import json
 import sys
 import shutil
@@ -28,6 +29,7 @@ try:
     from rich.panel import Panel
     from rich.prompt import Prompt
     from rich.markup import escape
+    from rich import box
 except ImportError:
     print("Missing dependencies. Run:  pip install yt-dlp rich click")
     sys.exit(1)
@@ -231,17 +233,24 @@ def save_config(cfg: dict):
 # ── History helpers ────────────────────────────────────────────────────────────
 
 def load_history() -> list:
-    if HISTORY_FILE.exists():
+    """History is a convenience: a missing or damaged file must never break a download."""
+    try:
         with open(HISTORY_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return []
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 def save_history(entry: dict):
     history = load_history()
     history.append(entry)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 # ── Windows path sanitiser ─────────────────────────────────────────────────────
@@ -370,6 +379,17 @@ def read_archive_ids(archive: Path) -> set:
 AUDIO_FORMATS = ("mp3", "m4a")
 
 
+def can_embed_thumbnail(audio=None) -> bool:
+    """Cover art in mp4/m4a needs the 'mutagen' package (part of yt-dlp[default]); mp3 only needs ffmpeg."""
+    return audio == "mp3" or importlib.util.find_spec("mutagen") is not None
+
+
+def warn_embed(embed: bool, audio=None):
+    if embed and not can_embed_thumbnail(audio):
+        console.print("[yellow]⚠ Cover art skipped: the 'mutagen' package is missing "
+                      "(chapters and tags still embed). Fix: pip install mutagen[/yellow]\n")
+
+
 def parse_langs(value):
     """'en, fr' -> ['en', 'fr'];  None/'' -> None."""
     langs = [l.strip() for l in (value or "").split(",") if l.strip()]
@@ -378,7 +398,7 @@ def parse_langs(value):
 
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
                    playlist_start: int, playlist_end: int, id_in_name: bool = True,
-                   audio: str = None, subs: list = None) -> dict:
+                   audio: str = None, subs: list = None, embed: bool = False) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
 
     # Windows-safe output template (avoids illegal filename chars)
@@ -427,6 +447,16 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
         opts.setdefault("postprocessors", []).append(
             {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
 
+    if embed:
+        # Chapters + tags (title, channel, date…) go in via ffmpeg; cover art on top when possible.
+        # Order matters: metadata first, thumbnail last.
+        pps = opts.setdefault("postprocessors", [])
+        pps.append({"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True})
+        if can_embed_thumbnail(audio):
+            opts["writethumbnail"] = True
+            pps.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
+            pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})   # deletes the loose image
+
     if playlist_start > 1:
         opts["playliststart"] = playlist_start
     if playlist_end > 0:
@@ -467,6 +497,21 @@ def report_suspect(suspect: list):
     if len(suspect) > 5:
         console.print(f"  [dim]… and {len(suspect) - 5} more[/dim]")
     console.print("  Delete the file and its line in downloaded.txt, then re-run the same command.")
+
+
+def read_url_file(path) -> tuple:
+    """Read URLs from a text file: one per line, '#' starts a comment. Returns (urls, bad_lines)."""
+    urls, bad = [], []
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        if not re.match(r"https?://", token):
+            bad.append((n, line))
+        elif token not in urls:          # drop duplicates, keep order
+            urls.append(token)
+    return urls, bad
 
 
 def run_with_retries(run_pass, scan_dir: Path, passes: int, errlog) -> None:
@@ -516,15 +561,18 @@ def cli():
               help="Also save subtitles, e.g. --subs en  or  --subs en,fr  (real captions, else auto-generated)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
+@click.option("--embed", is_flag=True,
+              help="Embed cover art, chapters and tags (title, channel, date) in each file")
+@click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
 @click.pass_context
-def download(ctx, url, output, quality, resume, start, end, archive, audio, subs, retry_passes):
+def download(ctx, url, output, quality, resume, start, end, archive, audio, subs, retry_passes, embed, yes):
     """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
 
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
-                          tabs="videos", limit=end, since=None, browser=None, yes=False,
-                          retry_passes=retry_passes, audio=audio, subs=subs)
+                          tabs="videos", limit=end, since=None, browser=None, yes=yes,
+                          retry_passes=retry_passes, audio=audio, subs=subs, embed=embed)
 
     require_ffmpeg()
     warn_if_old_ytdlp()
@@ -543,7 +591,7 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
 
     if not info:
         console.print("[red]❌  Could not retrieve playlist. Check the URL and try again.[/red]")
-        return
+        return "failed"
 
     title   = info.get("title", "Unknown Playlist")
     entries = info.get("entries") or [info]
@@ -553,11 +601,12 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
 
     # Where files go, naming style, and which videos are already finished
     langs  = parse_langs(subs)
-    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio, subs=langs)
+    warn_embed(embed, audio)
+    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio, subs=langs, embed=embed)
     folder = playlist_folder(opts, info, title)
     legacy = has_legacy_names(folder)
     if legacy:   # older downloads have no [id] in the name — keep that so nothing downloads twice
-        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio, subs=langs)
+        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio, subs=langs, embed=embed)
     archive_file = folder / "downloaded.txt"
     done_ids = read_archive_ids(archive_file) if archive else set()
     pending  = sum(1 for e in entries if e.get("id") not in done_ids)
@@ -572,6 +621,8 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
     tbl.add_row("[bold]Quality[/bold]",   f"audio only ({audio})" if audio else quality)
     if langs:
         tbl.add_row("[bold]Subtitles[/bold]", ", ".join(langs))
+    if embed:
+        tbl.add_row("[bold]Embed[/bold]", "cover art, chapters, tags")
     tbl.add_row("[bold]Output[/bold]",    output)
     tbl.add_row("[bold]Resume[/bold]",    "✔ Yes" if resume else "✘ No")
     if start > 1 or end > 0:
@@ -586,11 +637,11 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
     if archive and pending == 0:
         repair_folder(folder)
         console.print("[bold green]✅ Already up to date — nothing left to download.[/bold green]")
-        return
+        return "uptodate"
 
-    if not click.confirm("▶  Start download?", default=True):
+    if not yes and not click.confirm("▶  Start download?", default=True):
         console.print("[yellow]Aborted.[/yellow]")
-        return
+        return "aborted"
 
     Path(output).mkdir(parents=True, exist_ok=True)
     if archive:
@@ -707,7 +758,9 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
               help="Also save subtitles, e.g. --subs en  or  --subs en,fr  (real captions, else auto-generated)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
-def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs, retry_passes):
+@click.option("--embed", is_flag=True,
+              help="Embed cover art, chapters and tags (title, channel, date) in each file")
+def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs, retry_passes, embed):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
@@ -750,7 +803,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
 
     if not tab_entries:
         console.print("[red]❌  No videos found. Check the channel URL and try again.[/red]")
-        return
+        return "failed"
 
     channel_name = channel_name or base.rsplit("/", 1)[-1]
     chan_dir = Path(output) / (sanitize_filename(channel_name, is_id=False) + (" (audio)" if audio else ""))
@@ -767,20 +820,23 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
     tbl.add_row("[bold]Already have[/bold]", str(found - pending))
     tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]" + ("  (before --since filter)" if since else ""))
     tbl.add_row("[bold]Quality[/bold]",  f"audio only ({audio})" if audio else quality)
+    warn_embed(embed, audio)
     langs = parse_langs(subs)
     if langs:
         tbl.add_row("[bold]Subtitles[/bold]", ", ".join(langs))
+    if embed:
+        tbl.add_row("[bold]Embed[/bold]", "cover art, chapters, tags")
     tbl.add_row("[bold]Output[/bold]",   str(chan_dir))
     console.print(tbl)
     console.print()
 
     if pending == 0:
         console.print("[bold green]✅ Already up to date — nothing new to download.[/bold green]")
-        return
+        return "uptodate"
 
     if not yes and not click.confirm("▶  Start download?", default=True):
         console.print("[yellow]Aborted.[/yellow]")
-        return
+        return "aborted"
 
     chan_dir.mkdir(parents=True, exist_ok=True)
     errlog = _ErrorLog()
@@ -816,7 +872,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
                         "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
                     )
 
-                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio, subs=langs)
+                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio, subs=langs, embed=embed)
                     opts.update({
                         "outtmpl": tmpl,
                         "download_archive": str(archive),   # skip anything already downloaded
@@ -953,6 +1009,76 @@ def update():
         console.print(f"[bold green]✅ Updated:[/bold green] {YTDLP_VERSION} → {new}")
     else:
         console.print("[green]✅ Already on the latest yt-dlp.[/green]")
+
+
+# ── batch ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("-o", "--output", default=None, help="Output folder  (default from config)")
+@click.option("-q", "--quality", default=None, type=click.Choice(list(QUALITY_OPTIONS)),
+              help="Video quality  (default from config)")
+@click.option("--audio", type=click.Choice(AUDIO_FORMATS), default=None,
+              help="Audio only: save as mp3 or m4a instead of video")
+@click.option("--subs", default=None, metavar="LANGS", help="Also save subtitles, e.g. --subs en")
+@click.option("--embed", is_flag=True, help="Embed cover art, chapters and tags in each file")
+@click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
+              help="Extra automatic passes to finish unfinished downloads  (0 = off)")
+@click.pass_context
+def batch(ctx, file, output, quality, audio, subs, embed, retry_passes):
+    """Download every URL in FILE with no prompts. One URL per line, '#' for comments.
+
+    Playlists, channels and single videos can be mixed. A failure on one URL never
+    stops the rest. Re-running is cheap: finished videos are skipped.
+    """
+    require_ffmpeg()
+    urls, bad = read_url_file(file)
+    for n, line in bad:
+        console.print(f"[yellow]⚠ line {n} skipped (not a http(s) URL): {escape(line[:60])}[/yellow]")
+    if not urls:
+        console.print("[red]❌  No URLs found in the file.[/red]")
+        return
+    console.print(f"[cyan]📋 {len(urls)} URL(s) from {escape(str(file))}[/cyan]\n")
+
+    results = []                          # (url, icon, note)
+    for i, url in enumerate(urls, 1):
+        console.rule(f"[bold]{i}/{len(urls)}[/bold]  {escape(url[:70])}")
+        before = len(load_history())
+        try:
+            status = ctx.invoke(download, url=url, output=output, quality=quality, resume=True,
+                                start=1, end=0, archive=True, audio=audio, subs=subs,
+                                retry_passes=retry_passes, embed=embed, yes=True)
+            history = load_history()
+            if status == "failed":
+                results.append((url, "[red]✗[/red]", "could not read this URL"))
+            elif status == "uptodate":
+                results.append((url, "[green]•[/green]", "already up to date"))
+            elif len(history) > before:
+                e = history[-1]
+                bad_n = e.get("failed", 0)
+                results.append((url, "[yellow]⚠[/yellow]" if bad_n else "[green]✓[/green]",
+                                f"{e.get('downloaded', 0)} new, {bad_n} failed"))
+            else:
+                results.append((url, "[dim]–[/dim]", "nothing done"))
+        except KeyboardInterrupt:
+            results.append((url, "[yellow]⏸[/yellow]", "interrupted"))
+            console.print("\n[yellow]⏸  Batch stopped. Re-run the same command to continue "
+                          "(finished videos are skipped).[/yellow]")
+            break
+        except (Exception, SystemExit) as e:
+            results.append((url, "[red]✗[/red]", f"error: {str(e)[:70] or type(e).__name__}"))
+
+    console.print()
+    tbl = Table(title="Batch summary", box=box.ROUNDED, show_lines=False)
+    tbl.add_column("", width=2)
+    tbl.add_column("URL", overflow="ellipsis", max_width=50)
+    tbl.add_column("Result")
+    for url, icon, note in results:
+        tbl.add_row(icon, escape(url), escape(note))
+    console.print(tbl)
+    skipped = len(urls) - len(results)
+    if skipped:
+        console.print(f"[yellow]{skipped} URL(s) not started (batch was stopped).[/yellow]")
 
 
 # ── history ───────────────────────────────────────────────────────────────────

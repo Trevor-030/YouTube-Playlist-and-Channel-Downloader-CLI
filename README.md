@@ -70,6 +70,10 @@ yt channel "URL" --audio m4a
 yt download "URL" --subs en
 yt download "URL" --subs en,fr
 
+:: Embed cover art, chapters and tags (title, channel, date) inside each file
+yt download "URL" --embed
+yt download "URL" --audio mp3 --embed
+
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
@@ -96,6 +100,10 @@ yt download "https://www.youtube.com/@ChannelName"
 
 :: Preview playlist (or channel) contents without downloading
 yt info "URL"
+
+:: Download a whole list of URLs with no prompts (see urls.example.txt)
+yt batch urls.txt
+yt batch urls.txt -q 720p --audio mp3 --subs en
 
 :: Update yt-dlp (fixes most 403 and broken-download errors)
 yt update
@@ -196,6 +204,7 @@ yt history --last 50
 | `ERROR: Unable to download` | Update yt-dlp: `pip install -U yt-dlp` |
 | Filenames look weird | Already handled — Windows-safe filenames enabled |
 | Video has no sound | ffmpeg is missing or not on PATH |
+| "Cover art skipped" with `--embed` | The `mutagen` package is missing. Run `pip install mutagen` (setup.bat and pipx install it already) |
 | "may be cut off" warning after a run | That file is shorter than YouTube says. Delete it and its line in `downloaded.txt`, then re-run |
 | "yt-dlp is N days old" warning | Run `pip install -U "yt-dlp[default]"`. Old versions cause 403s and failed downloads |
 | Separate audio + video files (`name.f137.mp4` + `name.f140.m4a`) | The ffmpeg merge failed. The tool now retries the merge after every download; to fix old folders run `yt repair` |
