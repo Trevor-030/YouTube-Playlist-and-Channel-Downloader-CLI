@@ -89,6 +89,9 @@ yt download "https://www.youtube.com/@ChannelName"
 :: Preview playlist (or channel) contents without downloading
 yt info "URL"
 
+:: Update yt-dlp (fixes most 403 and broken-download errors)
+yt update
+
 :: Fix videos that came out as separate audio + video files
 yt repair
 yt repair "D:\Videos"
@@ -183,3 +186,14 @@ yt history --last 50
 | Separate audio + video files (`name.f137.mp4` + `name.f140.m4a`) | The ffmpeg merge failed. The tool now retries the merge after every download; to fix old folders run `yt repair` |
 | Channel run stops / gets slow | Ctrl+C and re-run the same command; it resumes. Update yt-dlp if YouTube changed |
 | Members-only / private videos | Skipped and listed as errors in the summary |
+
+---
+
+## 🧪 Tests
+
+```
+pip install pytest
+pytest
+```
+
+The tests cover repair, retries and naming. They need ffmpeg on PATH and skip themselves without it.

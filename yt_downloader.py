@@ -890,6 +890,25 @@ def repair(folder):
         console.print(f"\n[bold green]Done![/bold green]  {fixed}/{found} merged.")
 
 
+# ── update ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def update():
+    """Upgrade yt-dlp to the latest version (fixes most 403 and broken-download errors)."""
+    console.print(f"[yellow]⏳ Updating yt-dlp (now {YTDLP_VERSION})…[/yellow]")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--quiet", "yt-dlp[default]"])
+    if r.returncode != 0:
+        console.print("[red]Update failed.[/red] Try manually: pip install -U \"yt-dlp\\[default]\"")
+        return
+    new = subprocess.run(
+        [sys.executable, "-c", "from yt_dlp.version import __version__ as v; print(v)"],
+        capture_output=True, text=True).stdout.strip()
+    if new and new != YTDLP_VERSION:
+        console.print(f"[bold green]✅ Updated:[/bold green] {YTDLP_VERSION} → {new}")
+    else:
+        console.print("[green]✅ Already on the latest yt-dlp.[/green]")
+
+
 # ── history ───────────────────────────────────────────────────────────────────
 
 @cli.command()
