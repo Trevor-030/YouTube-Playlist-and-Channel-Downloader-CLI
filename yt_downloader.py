@@ -21,7 +21,7 @@ from pathlib import Path, WindowsPath
 
 try:
     import yt_dlp
-    from yt_dlp.utils import sanitize_filename
+    from yt_dlp.utils import sanitize_filename, parse_bytes
     from yt_dlp.version import __version__ as YTDLP_VERSION
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn
@@ -379,6 +379,45 @@ def read_archive_ids(archive: Path) -> set:
 AUDIO_FORMATS = ("mp3", "m4a")
 
 
+def parse_rate(ctx, param, value):
+    """Click callback: '500K' / '2M' / '1.5M' -> bytes per second (None if not given)."""
+    if not value:
+        return None
+    rate = parse_bytes(value)
+    if not rate or rate < 1024:
+        raise click.BadParameter("use a size like 500K or 2M  (bytes per second)")
+    return rate
+
+
+def notify(title: str, body: str):
+    """Best-effort desktop notification + sound. Never raises: a missing toast must not break a download."""
+    env = {**os.environ, "YT_TITLE": title, "YT_BODY": body}     # env vars: no quoting problems with emoji or quotes
+    try:
+        if sys.platform == "win32":
+            ps = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
+                "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+                "$x=$t.GetElementsByTagName('text');"
+                "$x[0].AppendChild($t.CreateTextNode($env:YT_TITLE))|Out-Null;"
+                "$x[1].AppendChild($t.CreateTextNode($env:YT_BODY))|Out-Null;"
+                "$id='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show([Windows.UI.Notifications.ToastNotification]::new($t))"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], env=env,
+                           capture_output=True, timeout=15, creationflags=0x08000000)   # no console flash
+            import winsound
+            winsound.MessageBeep()
+        elif sys.platform == "darwin":
+            subprocess.run(["osascript", "-e", "on run {t, b}", "-e", "display notification b with title t",
+                            "-e", "end run", title, body], capture_output=True, timeout=15)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, body], capture_output=True, timeout=15)
+        else:
+            print("\a", end="")
+    except Exception:
+        print("\a", end="")
+
+
 def can_embed_thumbnail(audio=None) -> bool:
     """Cover art in mp4/m4a needs the 'mutagen' package (part of yt-dlp[default]); mp3 only needs ffmpeg."""
     return audio == "mp3" or importlib.util.find_spec("mutagen") is not None
@@ -398,7 +437,8 @@ def parse_langs(value):
 
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
                    playlist_start: int, playlist_end: int, id_in_name: bool = True,
-                   audio: str = None, subs: list = None, embed: bool = False) -> dict:
+                   audio: str = None, subs: list = None, embed: bool = False,
+                   rate_limit: int = None) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
 
     # Windows-safe output template (avoids illegal filename chars)
@@ -446,6 +486,11 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
         })
         opts.setdefault("postprocessors", []).append(
             {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
+
+    if rate_limit:
+        # The limit applies per connection, so a single connection keeps the cap honest
+        opts["ratelimit"] = rate_limit
+        opts["concurrent_fragment_downloads"] = 1
 
     if embed:
         # Chapters + tags (title, channel, date…) go in via ffmpeg; cover art on top when possible.
@@ -563,16 +608,22 @@ def cli():
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
 @click.option("--embed", is_flag=True,
               help="Embed cover art, chapters and tags (title, channel, date) in each file")
+@click.option("--rate-limit", callback=parse_rate, default=None, metavar="RATE",
+              help="Max download speed, e.g. 500K or 2M (per second)")
+@click.option("--notify", "notify_when_done", is_flag=True,
+              help="Desktop notification and sound when everything is finished")
 @click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
 @click.pass_context
-def download(ctx, url, output, quality, resume, start, end, archive, audio, subs, retry_passes, embed, yes):
+def download(ctx, url, output, quality, resume, start, end, archive, audio, subs, retry_passes, embed,
+             rate_limit, notify_when_done, yes):
     """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
 
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
                           tabs="videos", limit=end, since=None, browser=None, yes=yes,
-                          retry_passes=retry_passes, audio=audio, subs=subs, embed=embed)
+                          retry_passes=retry_passes, audio=audio, subs=subs, embed=embed,
+                          rate_limit=rate_limit, notify_when_done=notify_when_done)
 
     require_ffmpeg()
     warn_if_old_ytdlp()
@@ -602,11 +653,13 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
     # Where files go, naming style, and which videos are already finished
     langs  = parse_langs(subs)
     warn_embed(embed, audio)
-    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio, subs=langs, embed=embed)
+    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio, subs=langs, embed=embed,
+                            rate_limit=rate_limit)
     folder = playlist_folder(opts, info, title)
     legacy = has_legacy_names(folder)
     if legacy:   # older downloads have no [id] in the name — keep that so nothing downloads twice
-        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio, subs=langs, embed=embed)
+        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio, subs=langs, embed=embed,
+                                rate_limit=rate_limit)
     archive_file = folder / "downloaded.txt"
     done_ids = read_archive_ids(archive_file) if archive else set()
     pending  = sum(1 for e in entries if e.get("id") not in done_ids)
@@ -731,6 +784,8 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
 
     console.print(f"\n📁  Saved to: [cyan]{output}[/cyan]")
     console.print(f"    (Open in Explorer:  [dim]explorer \"{output}\"[/dim])")
+    if notify_when_done:
+        notify("YouTube download finished", f"{title}: {len(downloaded)} new, {len(failed)} failed")
 
 
 # ── channel ───────────────────────────────────────────────────────────────────
@@ -758,9 +813,14 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
               help="Also save subtitles, e.g. --subs en  or  --subs en,fr  (real captions, else auto-generated)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
+@click.option("--rate-limit", callback=parse_rate, default=None, metavar="RATE",
+              help="Max download speed, e.g. 500K or 2M (per second)")
+@click.option("--notify", "notify_when_done", is_flag=True,
+              help="Desktop notification and sound when everything is finished")
 @click.option("--embed", is_flag=True,
               help="Embed cover art, chapters and tags (title, channel, date) in each file")
-def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs, retry_passes, embed):
+def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs, retry_passes, embed,
+            rate_limit, notify_when_done):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
@@ -872,7 +932,8 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
                         "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
                     )
 
-                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio, subs=langs, embed=embed)
+                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio, subs=langs, embed=embed,
+                                           rate_limit=rate_limit)
                     opts.update({
                         "outtmpl": tmpl,
                         "download_archive": str(archive),   # skip anything already downloaded
@@ -935,6 +996,8 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
 
     console.print(f"\n📁  Saved to: [cyan]{chan_dir}[/cyan]")
     console.print(f"    (Open in Explorer:  [dim]explorer \"{chan_dir}\"[/dim])")
+    if notify_when_done:
+        notify("YouTube download finished", f"{channel_name}: {len(downloaded)} new, {len(failed)} failed")
 
 
 # ── info ──────────────────────────────────────────────────────────────────────
@@ -1022,10 +1085,14 @@ def update():
               help="Audio only: save as mp3 or m4a instead of video")
 @click.option("--subs", default=None, metavar="LANGS", help="Also save subtitles, e.g. --subs en")
 @click.option("--embed", is_flag=True, help="Embed cover art, chapters and tags in each file")
+@click.option("--rate-limit", callback=parse_rate, default=None, metavar="RATE",
+              help="Max download speed, e.g. 500K or 2M (per second)")
+@click.option("--notify", "notify_when_done", is_flag=True,
+              help="Desktop notification and sound when everything is finished")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
 @click.pass_context
-def batch(ctx, file, output, quality, audio, subs, embed, retry_passes):
+def batch(ctx, file, output, quality, audio, subs, embed, rate_limit, notify_when_done, retry_passes):
     """Download every URL in FILE with no prompts. One URL per line, '#' for comments.
 
     Playlists, channels and single videos can be mixed. A failure on one URL never
@@ -1047,7 +1114,8 @@ def batch(ctx, file, output, quality, audio, subs, embed, retry_passes):
         try:
             status = ctx.invoke(download, url=url, output=output, quality=quality, resume=True,
                                 start=1, end=0, archive=True, audio=audio, subs=subs,
-                                retry_passes=retry_passes, embed=embed, yes=True)
+                                retry_passes=retry_passes, embed=embed, rate_limit=rate_limit,
+                                notify_when_done=False, yes=True)     # one notification at the very end
             history = load_history()
             if status == "failed":
                 results.append((url, "[red]✗[/red]", "could not read this URL"))
@@ -1079,6 +1147,19 @@ def batch(ctx, file, output, quality, audio, subs, embed, retry_passes):
     skipped = len(urls) - len(results)
     if skipped:
         console.print(f"[yellow]{skipped} URL(s) not started (batch was stopped).[/yellow]")
+    if notify_when_done:
+        problems = sum(1 for _, icon, _ in results if "✗" in icon or "⚠" in icon) + skipped
+        notify("YouTube batch finished", f"{len(urls)} URL(s) processed, {problems} need attention")
+
+
+# ── notify-test ───────────────────────────────────────────────────────────────
+
+@cli.command("notify-test")
+def notify_test():
+    """Send a test notification, to check that --notify works on this computer."""
+    console.print("[yellow]Sending a test notification…[/yellow]")
+    notify("YT Downloader", "Notifications work ✅")
+    console.print("Did a notification pop up (or did you hear a beep)? If not, --notify is silent here.")
 
 
 # ── history ───────────────────────────────────────────────────────────────────

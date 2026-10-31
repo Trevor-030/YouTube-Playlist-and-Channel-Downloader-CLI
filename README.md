@@ -74,6 +74,15 @@ yt download "URL" --subs en,fr
 yt download "URL" --embed
 yt download "URL" --audio mp3 --embed
 
+:: Cap the download speed so it does not eat all your data/bandwidth
+yt download "URL" --rate-limit 2M
+yt download "URL" --rate-limit 500K
+
+:: Pop-up notification and sound when everything is finished (great with batch)
+yt download "URL" --notify
+yt batch urls.txt --notify
+yt notify-test
+
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
@@ -204,6 +213,8 @@ yt history --last 50
 | `ERROR: Unable to download` | Update yt-dlp: `pip install -U yt-dlp` |
 | Filenames look weird | Already handled — Windows-safe filenames enabled |
 | Video has no sound | ffmpeg is missing or not on PATH |
+| `--notify` shows nothing | Run `yt notify-test`. Check Windows Focus Assist / Do Not Disturb is off. A beep still plays |
+| Slow with `--rate-limit` | That is the limit working. It also uses one connection, so it is slower than normal |
 | "Cover art skipped" with `--embed` | The `mutagen` package is missing. Run `pip install mutagen` (setup.bat and pipx install it already) |
 | "may be cut off" warning after a run | That file is shorter than YouTube says. Delete it and its line in `downloaded.txt`, then re-run |
 | "yt-dlp is N days old" warning | Run `pip install -U "yt-dlp[default]"`. Old versions cause 403s and failed downloads |
