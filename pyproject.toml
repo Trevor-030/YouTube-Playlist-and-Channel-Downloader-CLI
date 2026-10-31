@@ -15,3 +15,7 @@ yt = "yt_downloader:cli"
 
 [tool.setuptools]
 py-modules = ["yt_downloader"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
