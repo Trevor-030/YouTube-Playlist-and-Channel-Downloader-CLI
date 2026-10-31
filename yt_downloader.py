@@ -367,14 +367,20 @@ def read_archive_ids(archive: Path) -> set:
     return {line.split()[-1] for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
+AUDIO_FORMATS = ("mp3", "m4a")
+
+
 def build_ydl_opts(output_dir: str, quality: str, resume: bool,
-                   playlist_start: int, playlist_end: int, id_in_name: bool = True) -> dict:
+                   playlist_start: int, playlist_end: int, id_in_name: bool = True,
+                   audio: str = None) -> dict:
     fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
 
     # Windows-safe output template (avoids illegal filename chars)
     # The video id in the name ties every leftover file to its video (and survives title changes)
     name = "%(playlist_index)03d - %(title).100s" + (" [%(id)s]" if id_in_name else "") + ".%(ext)s"
-    outtmpl = os.path.join(output_dir.replace("%", "%%"), "%(playlist_title).80s", name)
+    # Audio-only goes to its own folder, so it never mixes with (or hides behind) video downloads
+    folder = "%(playlist_title).80s" + (" (audio)" if audio else "")
+    outtmpl = os.path.join(output_dir.replace("%", "%%"), folder, name)
 
     opts = {
         "format": fmt,
@@ -394,6 +400,13 @@ def build_ydl_opts(output_dir: str, quality: str, resume: bool,
         "restrictfilenames": False,
         "windowsfilenames": True,
     }
+
+    if audio:
+        for key in ("format_sort", "merge_output_format"):
+            opts.pop(key, None)
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best" if audio == "m4a" else "bestaudio/best"
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": audio,
+                                   "preferredquality": "192"}]
 
     if playlist_start > 1:
         opts["playliststart"] = playlist_start
@@ -478,17 +491,19 @@ def cli():
               help="End at this playlist index  (0 = all)")
 @click.option("--archive/--no-archive", default=True, show_default=True,
               help="Remember finished videos (downloaded.txt) so re-runs only touch what is missing")
+@click.option("--audio", type=click.Choice(AUDIO_FORMATS), default=None,
+              help="Audio only: save as mp3 or m4a instead of video (own '(audio)' folder)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
 @click.pass_context
-def download(ctx, url, output, quality, resume, start, end, archive, retry_passes):
+def download(ctx, url, output, quality, resume, start, end, archive, audio, retry_passes):
     """Download a YouTube playlist or single video (channel URLs switch to channel mode)."""
 
     if is_channel_url(url):
         console.print("[cyan]Channel URL detected — switching to channel mode.[/cyan]")
         return ctx.invoke(channel, url=url, output=output, quality=quality,
                           tabs="videos", limit=end, since=None, browser=None, yes=False,
-                          retry_passes=retry_passes)
+                          retry_passes=retry_passes, audio=audio)
 
     require_ffmpeg()
     warn_if_old_ytdlp()
@@ -516,11 +531,11 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
     total   = len(entries)
 
     # Where files go, naming style, and which videos are already finished
-    opts   = build_ydl_opts(output, quality, resume, start, end)
+    opts   = build_ydl_opts(output, quality, resume, start, end, audio=audio)
     folder = playlist_folder(opts, info, title)
     legacy = has_legacy_names(folder)
     if legacy:   # older downloads have no [id] in the name — keep that so nothing downloads twice
-        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False)
+        opts = build_ydl_opts(output, quality, resume, start, end, id_in_name=False, audio=audio)
     archive_file = folder / "downloaded.txt"
     done_ids = read_archive_ids(archive_file) if archive else set()
     pending  = sum(1 for e in entries if e.get("id") not in done_ids)
@@ -532,7 +547,7 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
     if archive:
         tbl.add_row("[bold]Already have[/bold]", str(total - pending))
         tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]")
-    tbl.add_row("[bold]Quality[/bold]",   quality)
+    tbl.add_row("[bold]Quality[/bold]",   f"audio only ({audio})" if audio else quality)
     tbl.add_row("[bold]Output[/bold]",    output)
     tbl.add_row("[bold]Resume[/bold]",    "✔ Yes" if resume else "✘ No")
     if start > 1 or end > 0:
@@ -634,7 +649,7 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
         "downloaded": len(downloaded),
         "failed":     len(failed),
         "output":     output,
-        "quality":    quality,
+        "quality":    f"audio-{audio}" if audio else quality,
     })
 
     report_suspect(suspect)
@@ -662,9 +677,11 @@ def download(ctx, url, output, quality, resume, start, end, archive, retry_passe
               type=click.Choice(["chrome", "edge", "firefox", "brave", "opera"]),
               help="Use your browser's YouTube login (helps with 403 / bot checks)")
 @click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
+@click.option("--audio", type=click.Choice(AUDIO_FORMATS), default=None,
+              help="Audio only: save as mp3 or m4a instead of video (own '(audio)' folder)")
 @click.option("--retry-passes", default=AUTO_PASSES, show_default=True,
               help="Extra automatic passes to finish unfinished downloads  (0 = off)")
-def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes):
+def channel(url, output, quality, tabs, limit, since, browser, yes, audio, retry_passes):
     """Download ALL videos from a channel.
 
     Re-run the same command later to fetch only new uploads
@@ -710,7 +727,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
         return
 
     channel_name = channel_name or base.rsplit("/", 1)[-1]
-    chan_dir = Path(output) / sanitize_filename(channel_name, is_id=False)
+    chan_dir = Path(output) / (sanitize_filename(channel_name, is_id=False) + (" (audio)" if audio else ""))
     archive  = chan_dir / "downloaded.txt"
     done_ids = read_archive_ids(archive)
 
@@ -723,7 +740,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
         tbl.add_row(f"[bold]{tab.capitalize()}[/bold]", str(len(v)))
     tbl.add_row("[bold]Already have[/bold]", str(found - pending))
     tbl.add_row("[bold]To download[/bold]",  f"[cyan]{pending}[/cyan]" + ("  (before --since filter)" if since else ""))
-    tbl.add_row("[bold]Quality[/bold]",  quality)
+    tbl.add_row("[bold]Quality[/bold]",  f"audio only ({audio})" if audio else quality)
     tbl.add_row("[bold]Output[/bold]",   str(chan_dir))
     console.print(tbl)
     console.print()
@@ -770,7 +787,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
                         "%(upload_date>%Y-%m-%d)s - %(title).100s [%(id)s].%(ext)s",
                     )
 
-                    opts = build_ydl_opts(output, quality, True, 1, limit)
+                    opts = build_ydl_opts(output, quality, True, 1, limit, audio=audio)
                     opts.update({
                         "outtmpl": tmpl,
                         "download_archive": str(archive),   # skip anything already downloaded
@@ -826,7 +843,7 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, retry_passes
         "downloaded": len(downloaded),
         "failed":     len(failed),
         "output":     str(chan_dir),
-        "quality":    quality,
+        "quality":    f"audio-{audio}" if audio else quality,
     })
 
     report_suspect(suspect)

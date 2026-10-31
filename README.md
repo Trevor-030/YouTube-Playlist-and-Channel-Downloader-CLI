@@ -62,6 +62,10 @@ yt download "URL" -q 720p -o "C:\Users\You\Videos"
 :: Download only videos 3 to 10
 yt download "URL" --start 3 --end 10
 
+:: Audio only (mp3 or m4a) — saved in a separate "(audio)" folder
+yt download "URL" --audio mp3
+yt channel "URL" --audio m4a
+
 :: Resume if it was interrupted (on by default)
 yt download "URL" --resume
 
