@@ -401,3 +401,82 @@ def test_batch_sends_one_notification_at_the_end(tmp_path, monkeypatch):
 def test_speed_and_notify_flags_exist(cmd):
     names = {p.name for p in y.cli.commands[cmd].params}
     assert {"rate_limit", "notify_when_done"} <= names
+
+
+# ── add-ids (rename old files to carry the video id) ──────────────────────────
+
+def _stem(i, e):
+    return f"{i:03d} - {e['title']}"
+
+
+def _entries():
+    return [{"id": "aaaaaaaaaaa", "title": "One"}, {"id": "bbbbbbbbbbb", "title": "Two"},
+            None, {"id": "ddddddddddd", "title": "Four"}]
+
+
+def test_plan_renames_all_sidecar_files(tmp_path):
+    for n in ("001 - One.mp4", "001 - One.en.srt", "001 - One.f137.mp4.part"):
+        (tmp_path / n).write_text("x")
+    plan = y.plan_id_renames(tmp_path, _entries(), _stem)
+    assert {n.name for _, n in plan["rename"]} == {
+        "001 - One [aaaaaaaaaaa].mp4", "001 - One [aaaaaaaaaaa].en.srt", "001 - One [aaaaaaaaaaa].f137.mp4.part"}
+
+
+def test_plan_skips_done_missing_and_none_entries(tmp_path):
+    (tmp_path / "002 - Two [bbbbbbbbbbb].mp4").write_text("x")       # already tagged
+    plan = y.plan_id_renames(tmp_path, _entries(), _stem)            # 003 is None, 004 not downloaded
+    assert plan["rename"] == [] and plan["done"] == 1 and plan["mismatched"] == []
+
+
+def test_plan_never_renames_a_file_with_a_different_title(tmp_path):
+    (tmp_path / "001 - Something else.mp4").write_text("x")
+    (tmp_path / "099 - Orphan.mp4").write_text("x")
+    plan = y.plan_id_renames(tmp_path, _entries(), _stem)
+    assert plan["rename"] == []
+    assert plan["mismatched"] == [(1, "One", "001 - Something else.mp4")]
+    assert [f.name for f in plan["orphans"]] == ["099 - Orphan.mp4"]
+
+
+def test_plan_does_not_overwrite_or_exceed_path_limit(tmp_path, monkeypatch):
+    (tmp_path / "001 - One.mp4").write_text("x")
+    (tmp_path / "001 - One [aaaaaaaaaaa].mp4").write_text("already here")
+    plan = y.plan_id_renames(tmp_path, _entries(), _stem)
+    assert plan["rename"] == [] and "already exists" in plan["skipped"][0][1]
+    (tmp_path / "001 - One [aaaaaaaaaaa].mp4").unlink()
+    monkeypatch.setattr(y, "MAX_PATH", 10)
+    assert "too long" in y.plan_id_renames(tmp_path, _entries(), _stem)["skipped"][0][1]
+
+
+def _run_add_ids(tmp_path, monkeypatch, *flags):
+    """Run `yt add-ids` against a folder named exactly like yt-dlp's old naming would make it."""
+    from click.testing import CliRunner
+    ents = [{"id": "aaaaaaaaaaa", "title": "Intro ☕ v1.2: what/why?"}, {"id": "bbbbbbbbbbb", "title": "x" * 150}]
+    monkeypatch.setattr(y, "fetch_playlist_info", lambda u: {"title": "My List ☕", "entries": ents})
+    opts = y.build_ydl_opts(str(tmp_path), "best", True, 1, 0, id_in_name=False)
+    ydl = y.yt_dlp.YoutubeDL({**opts, "quiet": True})
+    names = []
+    for i, e in enumerate(ents, 1):
+        p = Path(ydl.prepare_filename({"id": e["id"], "title": e["title"], "ext": "mp4",
+                                       "playlist_title": "My List ☕", "playlist_index": i}))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        names.append(p)
+    res = CliRunner().invoke(y.cli, ["add-ids", "https://youtube.com/playlist?list=x", "-o", str(tmp_path), *flags])
+    return res, names
+
+
+def test_add_ids_dry_run_changes_nothing(tmp_path, monkeypatch):
+    res, names = _run_add_ids(tmp_path, monkeypatch)
+    assert res.exit_code == 0 and "Dry run" in res.output
+    assert all(p.exists() for p in names)
+
+
+def test_add_ids_apply_handles_awkward_titles_and_is_repeatable(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    res, names = _run_add_ids(tmp_path, monkeypatch, "--apply")
+    assert res.exit_code == 0 and "Renamed 2 file(s)" in res.output
+    left = sorted(p.name for p in names[0].parent.iterdir())
+    assert any("[aaaaaaaaaaa].mp4" in n for n in left) and any("[bbbbbbbbbbb].mp4" in n for n in left)
+    assert not y.has_legacy_names(names[0].parent)                  # new downloads now use the new naming too
+    again = CliRunner().invoke(y.cli, ["add-ids", "https://youtube.com/playlist?list=x", "-o", str(tmp_path), "--apply"])
+    assert "Nothing to rename" in again.output
