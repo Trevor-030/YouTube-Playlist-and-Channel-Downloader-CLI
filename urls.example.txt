@@ -1,0 +1,5 @@
+# One URL per line. Lines starting with # are ignored.
+# Playlists, channels and single videos can be mixed.
+https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID   # notes after a # are fine too
+https://www.youtube.com/@ChannelName
+https://www.youtube.com/watch?v=VIDEO_ID
