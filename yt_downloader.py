@@ -3,640 +3,44 @@
 YouTube Playlist & Channel Downloader CLI  —  Windows Edition
 -----------------------------------------------------
 Requirements:
-    pip install yt-dlp rich click
+    pip install "yt-dlp[default]" rich click
     ffmpeg must be installed and on PATH (see README)
+
+This file is the command line (the `yt` command). The building blocks are in the ytdl/ folder next to it.
 """
 
+import click
 import os
 import re
-import importlib.util
-import json
-import sys
-import shutil
 import subprocess
-import time
-import click
+import sys
+import yt_dlp
+
 from datetime import datetime
 from pathlib import Path
+from rich import box
+from rich.markup import escape
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+from yt_dlp.utils import sanitize_filename
+from yt_dlp.version import __version__ as YTDLP_VERSION
+
+from ytdl.checks import looks_truncated, report_suspect, warn_if_no_js_runtime, warn_if_old_ytdlp
+from ytdl.common import _ErrorLog, clean_msg, console, require_ffmpeg, safe_win_path
+from ytdl.config import CONFIG_FILE, DEFAULT_OUTPUT, HISTORY_FILE, load_config, load_history, save_config, save_history
+from ytdl.layout import AUTO_PASSES, has_legacy_names, plan_id_renames, playlist_folder, read_archive_ids, read_url_file, run_with_retries
+from ytdl.notifications import notify
+from ytdl.options import AUDIO_FORMATS, QUALITY_OPTIONS, build_ydl_opts, parse_langs, parse_rate, warn_embed
+from ytdl.repair import repair_folder
+from ytdl.sources import CHANNEL_TABS, channel_base, fetch_playlist_info, is_channel_url, resolve_url
 
-try:
-    import yt_dlp
-    from yt_dlp.utils import sanitize_filename, parse_bytes
-    from yt_dlp.version import __version__ as YTDLP_VERSION
-    from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.markup import escape
-    from rich import box
-except ImportError:
-    print("Missing dependencies. Run:  pip install yt-dlp rich click")
-    sys.exit(1)
-
-console = Console()
-
-# ── ffmpeg check ───────────────────────────────────────────────────────────────
-
-def check_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def require_ffmpeg():
-    if not check_ffmpeg():
-        console.print(Panel(
-            "[bold red]ffmpeg not found on PATH![/bold red]\n\n"
-            "ffmpeg is required to merge video and audio into a single .mp4 file.\n"
-            "Without it, you get separate [yellow].f136.mp4[/yellow] and [yellow].f251.webm[/yellow] files.\n\n"
-            "[bold]Fix — run ONE of these in PowerShell / CMD (then restart terminal):[/bold]\n\n"
-            "  [cyan]winget install Gyan.FFmpeg[/cyan]   (recommended)\n"
-            "  [cyan]choco install ffmpeg[/cyan]          (if you have Chocolatey)\n\n"
-            "Download manually: https://ffmpeg.org/download.html\n"
-            "Then add the [bold]bin[/bold] folder to your system PATH.",
-            title="⚠  Missing ffmpeg",
-            border_style="red",
-        ))
-        raise SystemExit(1)
-
-
-# ── Repair: merge leftover video/audio parts ───────────────────────────────────
-# yt-dlp downloads video and audio as separate files (name.f137.mp4 + name.f140.m4a)
-# and merges them with ffmpeg. If the merge fails, those parts are left behind.
-
-# name.f137.mp4 / name.f251.webm / name.f251-drc.webm / name.f140-1.m4a
-_PART_RE = re.compile(r"^(?P<base>.+)\.f(?P<itag>\d+)(?:-[A-Za-z0-9]+)*\.(?P<ext>[A-Za-z0-9]+)$")
-_AUDIO_EXTS  = {"m4a", "mp3", "opus", "aac", "ogg", "oga", "wav", "flac"}
-_AUDIO_ITAGS = {"139", "140", "141", "249", "250", "251", "256", "258", "325", "327", "328", "338", "599", "600"}
-
-
-def find_split_files(root: Path) -> dict:
-    """Group leftover  <name>.fNNN.<ext>  files by <name>."""
-    groups = {}
-    for p in Path(root).rglob("*"):
-        m = _PART_RE.match(p.name)
-        if m and p.is_file():
-            groups.setdefault(p.parent / m["base"], []).append(p)
-    return groups
-
-
-def find_incomplete(root: Path) -> list:
-    """Half-downloaded files (.part / .ytdl) — these need the download re-run, not a merge."""
-    return [p for p in Path(root).rglob("*") if p.is_file() and p.suffix in (".part", ".ytdl")]
-
-
-def _guess_kinds(path: Path) -> set:
-    """Fallback when ffprobe can't tell: judge by extension / YouTube format id."""
-    m = _PART_RE.match(path.name)
-    if m and (m["ext"].lower() in _AUDIO_EXTS or m["itag"] in _AUDIO_ITAGS):
-        return {"audio"}
-    return {"video"}
-
-
-def _probe_kinds(path: Path) -> set:
-    probe = shutil.which("ffprobe")
-    if not probe:
-        return set()
-    r = subprocess.run(
-        [probe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path.name],
-        capture_output=True, text=True, errors="replace", cwd=path.parent)
-    return set(r.stdout.split())
-
-
-def _ffmpeg_merge(video: Path, audio: Path, out: Path, audio_args: list) -> tuple:
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", video.name, "-i", audio.name,
-           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args,
-           "-movflags", "+faststart", out.name]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", cwd=out.parent)
-    ok = r.returncode == 0 and out.exists() and out.stat().st_size > 0
-    return ok, r.stderr.strip()
-
-
-def merge_group(base: Path, parts: list) -> tuple:
-    """Merge one video's parts. Returns (status, detail); status is merged/exists/failed/skipped.
-
-    ffmpeg/ffprobe only ever see short ASCII temp names (emoji, accents and very long
-    titles in file names break them on Windows); the real names are restored afterwards.
-    """
-    folder = base.parent
-    target = folder / f"{base.name}.mp4"
-    if target.exists():
-        return "exists", ""
-
-    moved = []          # (temp path, original path)
-    out = folder / "_rp_out.mp4"
-    status, detail = "skipped", ""
-    try:
-        for i, p in enumerate(parts):
-            t = folder / f"_rp{i}{p.suffix}"
-            p.rename(t)
-            moved.append((t, p))
-
-        kinds = {t: (_probe_kinds(t) or _guess_kinds(orig)) for t, orig in moved}
-        detail = ", ".join(f"{orig.name[-28:]} → {'+'.join(sorted(kinds[t]))}" for t, orig in moved)
-        video = next((t for t in kinds if "video" in kinds[t] and "audio" not in kinds[t]), None)
-        audio = next((t for t in kinds if "audio" in kinds[t] and "video" not in kinds[t]), None)
-
-        if video and audio:
-            ok, err = _ffmpeg_merge(video, audio, out, ["-c:a", "copy"])
-            if not ok:   # e.g. Opus audio can't go into mp4 — re-encode just the audio
-                ok, err = _ffmpeg_merge(video, audio, out, ["-c:a", "aac", "-b:a", "192k"])
-            if ok:
-                out.replace(target)
-                for t, _ in moved:
-                    t.unlink(missing_ok=True)
-                moved = []
-                status = "merged"
-            else:
-                status, detail = "failed", err[-200:]
-    finally:
-        out.unlink(missing_ok=True)
-        for t, orig in moved:           # not merged → put the original names back
-            if t.exists():
-                t.rename(orig)
-    return status, detail
-
-
-def repair_folder(root: Path) -> tuple:
-    """Find and merge split video/audio files under root. Returns (found, fixed, incomplete)."""
-    groups = find_split_files(root)
-    incomplete = find_incomplete(root)
-    if not groups and not incomplete:
-        return 0, 0, 0
-
-    fixed = 0
-    if groups:
-        console.print(f"\n[yellow]🔧 {len(groups)} video(s) came out as separate audio + video files — merging…[/yellow]")
-    for base, parts in sorted(groups.items()):
-        name = escape(base.name[:60])
-        status, detail = merge_group(base, parts)
-        if status == "merged":
-            fixed += 1
-            console.print(f"  [green]✓[/green] {name}")
-        elif status == "exists":
-            console.print(f"  [yellow]•[/yellow] {name} — merged .mp4 already exists; leftover parts can be deleted")
-        elif status == "failed":
-            console.print(f"  [red]✗[/red] {name} — ffmpeg could not merge it")
-            console.print(f"    [dim]{escape(detail)}[/dim]")
-        else:
-            waiting = [q for q in incomplete if q.parent == base.parent and q.name.startswith(base.name + ".f")]
-            if waiting:
-                console.print(f"  [yellow]⏳ {name} — one half is still a half-finished .part download; "
-                              f"re-run the same download command to finish it, then it merges[/yellow]")
-            else:
-                console.print(f"  [dim]– {name} — no video + audio pair found[/dim]")
-            console.print(f"    [dim]{escape(detail)}[/dim]")
-
-    if incomplete:
-        console.print(f"\n[yellow]⚠ {len(incomplete)} incomplete download(s) (.part/.ytdl) — "
-                      f"re-run the same download command to finish them:[/yellow]")
-        for p in incomplete[:5]:
-            console.print(f"  [dim]{escape(p.name[:80])}[/dim]")
-        if len(incomplete) > 5:
-            console.print(f"  [dim]… and {len(incomplete) - 5} more[/dim]")
-    return len(groups), fixed, len(incomplete)
-
-
-# ── Config & history stored in %APPDATA%\YTDownloader ──────────────────────────
-APP_DIR      = Path(os.environ.get("APPDATA", Path.home())) / "YTDownloader"
-HISTORY_FILE = APP_DIR / "history.json"
-CONFIG_FILE  = APP_DIR / "config.json"
-APP_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_OUTPUT = str(Path.home() / "Videos" / "YT Downloads")
-
-# Format strings: prefer pre-merged mp4 stream, then merge with ffmpeg, then any single-file fallback
-# Prefer H.264 video + AAC audio inside each resolution: plays everywhere on Windows and
-# merges into mp4 without codec trouble. Falls back to whatever exists (webm/AV1/Opus).
-FORMAT_SORT = ["res", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]
-QUALITY_OPTIONS = {
-    "best":  "bv*+ba/b",
-    "1080p": "bv*[height<=1080]+ba/b[height<=1080]",
-    "720p":  "bv*[height<=720]+ba/b[height<=720]",
-    "480p":  "bv*[height<=480]+ba/b[height<=480]",
-    "360p":  "bv*[height<=360]+ba/b[height<=360]",
-}
-
-
-# ── Config helpers ─────────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"default_output": DEFAULT_OUTPUT, "default_quality": "best"}
-
-
-def save_config(cfg: dict):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-
-# ── History helpers ────────────────────────────────────────────────────────────
-
-def load_history() -> list:
-    """History is a convenience: a missing or damaged file must never break a download."""
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, ValueError):
-        return []
-
-
-def save_history(entry: dict):
-    history = load_history()
-    history.append(entry)
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-# ── Windows path sanitiser ─────────────────────────────────────────────────────
-
-def safe_win_path(p: str) -> str:
-    """Expand env vars like %USERPROFILE% and resolve the path."""
-    return str(Path(os.path.expandvars(p)).resolve())
-
-
-# ── yt-dlp helpers ─────────────────────────────────────────────────────────────
-
-def fetch_playlist_info(url: str) -> dict | None:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "ignoreerrors": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            return ydl.extract_info(url, download=False)
-        except Exception as e:
-            console.print(f"[red]Error fetching info: {e}[/red]")
-            return None
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m|\[[0-9;]*m")
-
-
-def clean_msg(msg: str) -> str:
-    return _ANSI_RE.sub("", msg).strip()
-
-
-def warn_if_old_ytdlp(max_age_days: int = 60):
-    """YouTube changes often; an old yt-dlp is the usual cause of 403s and broken downloads."""
-    try:
-        released = datetime.strptime(".".join(YTDLP_VERSION.split(".")[:3]), "%Y.%m.%d")
-    except ValueError:
-        return
-    age = (datetime.now() - released).days
-    if age > max_age_days:
-        console.print(f"[yellow]⚠ yt-dlp {YTDLP_VERSION} is {age} days old. Update:[/yellow] "
-                      f"[cyan]pip install -U \"yt-dlp\\[default]\"[/cyan]\n")
-
-
-def media_duration(path: Path):
-    """Length in seconds via ffprobe, or None. Probes a short ASCII hard link (emoji names break ffprobe on Windows)."""
-    probe = shutil.which("ffprobe")
-    if not probe or not path.is_file():
-        return None
-    tmp = path.parent / f"_rp_probe{path.suffix}"
-    try:
-        tmp.unlink(missing_ok=True)
-        os.link(path, tmp)
-        r = subprocess.run(
-            [probe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", tmp.name],
-            capture_output=True, text=True, errors="replace", cwd=path.parent)
-        return float(r.stdout.strip())
-    except (OSError, ValueError):
-        return None
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def looks_truncated(path: Path, expected) -> bool:
-    """True if the file is clearly shorter than the length YouTube reports."""
-    if not expected:
-        return False
-    actual = media_duration(path)
-    return actual is not None and actual < expected * 0.95 - 2
-
-
-def warn_if_no_js_runtime():
-    """YouTube now needs a JS runtime (Deno) for yt-dlp; without it downloads often fail with 403."""
-    import shutil
-    if shutil.which("deno") is None:
-        console.print(Panel(
-            "[bold yellow]Deno (JavaScript runtime) not found.[/bold yellow]\n"
-            "yt-dlp needs it for YouTube; without it you will likely get [red]HTTP 403[/red] errors.\n\n"
-            "  [cyan]winget install DenoLand.Deno[/cyan]   (then restart the terminal)\n"
-            "  [cyan]pip install -U \"yt-dlp\\[default]\"[/cyan]",
-            border_style="yellow",
-        ))
-    console.print(f"[dim]yt-dlp version: {yt_dlp.version.__version__}[/dim]")
-
-
-# ── Channel helpers ────────────────────────────────────────────────────────────
-
-CHANNEL_TABS = ("videos", "shorts", "streams")
-_CHANNEL_RE = re.compile(r"youtube\.com/(@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+)", re.I)
-_TAB_RE = re.compile(r"/(videos|shorts|streams|live|featured|playlists|releases|podcasts|community|about)$", re.I)
-
-
-def is_channel_url(url: str) -> bool:
-    """True for @handle, /channel/UC…, /c/name and /user/name URLs (not playlists or single videos)."""
-    return bool(_CHANNEL_RE.search(url)) and "list=" not in url and "watch?v=" not in url
-
-
-def channel_base(url: str) -> str:
-    """Strip query string and any trailing tab (/videos, /shorts, …) from a channel URL."""
-    url = url.split("?")[0].split("#")[0].rstrip("/")
-    return _TAB_RE.sub("", url)
-
-
-def resolve_url(url: str) -> str:
-    """Point a bare channel URL at its Videos tab so yt-dlp returns videos, not tab playlists."""
-    return f"{channel_base(url)}/videos" if is_channel_url(url) else url
-
-
-class _ErrorLog:
-    """yt-dlp logger that stays quiet but remembers errors (private/members-only videos, etc.)."""
-    def __init__(self):
-        self.errors = []
-    def debug(self, msg): pass
-    def info(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): self.errors.append(str(msg))
-
-
-def read_archive_ids(archive: Path) -> set:
-    if not archive.exists():
-        return set()
-    return {line.split()[-1] for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()}
-
-
-AUDIO_FORMATS = ("mp3", "m4a")
-
-
-def parse_rate(ctx, param, value):
-    """Click callback: '500K' / '2M' / '1.5M' -> bytes per second (None if not given)."""
-    if not value:
-        return None
-    rate = parse_bytes(value)
-    if not rate or rate < 1024:
-        raise click.BadParameter("use a size like 500K or 2M  (bytes per second)")
-    return rate
-
-
-def notify(title: str, body: str):
-    """Best-effort desktop notification + sound. Never raises: a missing toast must not break a download."""
-    env = {**os.environ, "YT_TITLE": title, "YT_BODY": body}     # env vars: no quoting problems with emoji or quotes
-    try:
-        if sys.platform == "win32":
-            ps = (
-                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
-                "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-                "$x=$t.GetElementsByTagName('text');"
-                "$x[0].AppendChild($t.CreateTextNode($env:YT_TITLE))|Out-Null;"
-                "$x[1].AppendChild($t.CreateTextNode($env:YT_BODY))|Out-Null;"
-                "$id='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
-                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show([Windows.UI.Notifications.ToastNotification]::new($t))"
-            )
-            subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], env=env,
-                           capture_output=True, timeout=15, creationflags=0x08000000)   # no console flash
-            import winsound
-            winsound.MessageBeep()
-        elif sys.platform == "darwin":
-            subprocess.run(["osascript", "-e", "on run {t, b}", "-e", "display notification b with title t",
-                            "-e", "end run", title, body], capture_output=True, timeout=15)
-        elif shutil.which("notify-send"):
-            subprocess.run(["notify-send", title, body], capture_output=True, timeout=15)
-        else:
-            print("\a", end="")
-    except Exception:
-        print("\a", end="")
-
-
-def can_embed_thumbnail(audio=None) -> bool:
-    """Cover art in mp4/m4a needs the 'mutagen' package (part of yt-dlp[default]); mp3 only needs ffmpeg."""
-    return audio == "mp3" or importlib.util.find_spec("mutagen") is not None
-
-
-def warn_embed(embed: bool, audio=None):
-    if embed and not can_embed_thumbnail(audio):
-        console.print("[yellow]⚠ Cover art skipped: the 'mutagen' package is missing "
-                      "(chapters and tags still embed). Fix: pip install mutagen[/yellow]\n")
-
-
-def parse_langs(value):
-    """'en, fr' -> ['en', 'fr'];  None/'' -> None."""
-    langs = [l.strip() for l in (value or "").split(",") if l.strip()]
-    return langs or None
-
-
-def build_ydl_opts(output_dir: str, quality: str, resume: bool,
-                   playlist_start: int, playlist_end: int, id_in_name: bool = True,
-                   audio: str = None, subs: list = None, embed: bool = False,
-                   rate_limit: int = None) -> dict:
-    fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS["best"])
-
-    # Windows-safe output template (avoids illegal filename chars)
-    # The video id in the name ties every leftover file to its video (and survives title changes)
-    name = "%(playlist_index)03d - %(title).100s" + (" [%(id)s]" if id_in_name else "") + ".%(ext)s"
-    # Audio-only goes to its own folder, so it never mixes with (or hides behind) video downloads
-    folder = "%(playlist_title).80s" + (" (audio)" if audio else "")
-    outtmpl = os.path.join(output_dir.replace("%", "%%"), folder, name)
-
-    opts = {
-        "format": fmt,
-        "format_sort": FORMAT_SORT,
-        "outtmpl": outtmpl,
-        "continuedl": resume,
-        "concurrent_fragment_downloads": 4,
-        "retries": 10,                 # network drops are what leave .part files behind
-        "fragment_retries": 10,
-        "ignoreerrors": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [],
-        # Merge into mp4 (works well on Windows without extra codecs)
-        "merge_output_format": "mp4",
-        # Restrict filenames to ASCII-safe chars for Windows compatibility
-        "restrictfilenames": False,
-        "windowsfilenames": True,
-    }
-
-    if audio:
-        for key in ("format_sort", "merge_output_format"):
-            opts.pop(key, None)
-        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best" if audio == "m4a" else "bestaudio/best"
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": audio,
-                                   "preferredquality": "192"}]
-
-    if subs:
-        # Real captions first; YouTube's auto-generated ones only where no real captions exist.
-        # Saved beside the video as  <name>.<lang>.srt
-        opts.update({
-            "writesubtitles": True,
-            "writeautomaticsub": subs != ["all"],     # 'all' would pull dozens of auto translations
-            "subtitleslangs": subs,
-            "subtitlesformat": "srt/vtt/best",
-            "sleep_interval_subtitles": 1,            # YouTube rate-limits caption requests
-        })
-        opts.setdefault("postprocessors", []).append(
-            {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
-
-    if rate_limit:
-        # The limit applies per connection, so a single connection keeps the cap honest
-        opts["ratelimit"] = rate_limit
-        opts["concurrent_fragment_downloads"] = 1
-
-    if embed:
-        # Chapters + tags (title, channel, date…) go in via ffmpeg; cover art on top when possible.
-        # Order matters: metadata first, thumbnail last.
-        pps = opts.setdefault("postprocessors", [])
-        pps.append({"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True})
-        if can_embed_thumbnail(audio):
-            opts["writethumbnail"] = True
-            pps.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
-            pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})   # deletes the loose image
-
-    if playlist_start > 1:
-        opts["playliststart"] = playlist_start
-    if playlist_end > 0:
-        opts["playlistend"] = playlist_end
-
-    return opts
-
-
-# ── Playlist layout, archive & auto-retry ──────────────────────────────────────
-
-AUTO_PASSES = 3                      # extra passes to finish .part downloads automatically
-_ID_TAG = re.compile(r"\[[A-Za-z0-9_-]{11}\](\.|$)")
-
-
-def playlist_folder(opts: dict, info: dict, title: str) -> Path:
-    """Ask yt-dlp itself where this playlist's files will go (same sanitising as a real download)."""
-    probe = {"id": "x", "title": "t", "ext": "mp4"}
-    if info.get("entries"):
-        probe.update(playlist_title=title, playlist_index=1)
-    with yt_dlp.YoutubeDL({**opts, "quiet": True, "logger": None}) as y:
-        return Path(os.path.dirname(y.prepare_filename(probe)))
-
-
-def has_legacy_names(folder: Path) -> bool:
-    """True if the folder holds numbered files that were saved without a [video id]."""
-    if not folder.is_dir():
-        return False
-    return any(re.match(r"\d+ - ", f.name) and not _ID_TAG.search(f.name)
-               for f in folder.iterdir() if f.is_file())
-
-
-def report_suspect(suspect: list):
-    if not suspect:
-        return
-    console.print(f"\n[yellow]⚠ {len(suspect)} file(s) are shorter than YouTube says — may be cut off:[/yellow]")
-    for n in suspect[:5]:
-        console.print(f"  [dim]{escape(n[:90])}[/dim]")
-    if len(suspect) > 5:
-        console.print(f"  [dim]… and {len(suspect) - 5} more[/dim]")
-    console.print("  Delete the file and its line in downloaded.txt, then re-run the same command.")
-
-
-def read_url_file(path) -> tuple:
-    """Read URLs from a text file: one per line, '#' starts a comment. Returns (urls, bad_lines)."""
-    urls, bad = [], []
-    for n, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        token = line.split()[0]
-        if not re.match(r"https?://", token):
-            bad.append((n, line))
-        elif token not in urls:          # drop duplicates, keep order
-            urls.append(token)
-    return urls, bad
-
-
-# ── Add video ids to old file names ────────────────────────────────────────────
-
-MAX_PATH = 259 if os.name == "nt" else 4000          # Windows refuses longer paths
-
-
-def plan_id_renames(folder: Path, entries: list, expected_stem) -> dict:
-    """Work out how to rename old-style files ('001 - Title.mp4') to '001 - Title [id].mp4'.
-
-    entries:       the playlist's entries in order (None allowed), position = playlist index.
-    expected_stem: function(index, entry) -> the name yt-dlp WOULD have given that video, without extension.
-
-    A file only counts as belonging to a video if its name starts with that exact expected name, so a
-    changed or reordered playlist is never renamed wrongly. Everything is reported, nothing is touched.
-    """
-    files = sorted(f for f in folder.iterdir() if f.is_file())
-    plan, done, mismatched, claimed = [], 0, [], set()
-
-    for idx, entry in enumerate(entries, 1):
-        if not entry or not entry.get("id") or not entry.get("title"):
-            continue
-        stem = expected_stem(idx, entry)
-        tagged = f"{stem} [{entry['id']}]"
-        have_id = [f for f in files if f.name.startswith(tagged)]
-        mine = [f for f in files if f.name.startswith(stem + ".")]
-        claimed.update(have_id)
-        claimed.update(mine)
-        if have_id and not mine:
-            done += 1
-            continue
-        if not mine:
-            same_index = [f for f in files if f.name.startswith(f"{idx:03d} - ") and f not in claimed
-                          and not _ID_TAG.search(f.name)]
-            if same_index:
-                mismatched.append((idx, entry["title"], same_index[0].name))
-                claimed.update(same_index)
-            continue                                   # not downloaded yet
-        for f in mine:
-            plan.append((f, f.with_name(f"{tagged}{f.name[len(stem):]}")))
-
-    skipped = []
-    ok = []
-    for old, new in plan:
-        if new.exists():
-            skipped.append((old, "target already exists"))
-        elif len(str(new)) > MAX_PATH:
-            skipped.append((old, "new name would be too long for Windows"))
-        else:
-            ok.append((old, new))
-
-    orphans = [f for f in files if f not in claimed and re.match(r"\d+ - ", f.name)
-               and not _ID_TAG.search(f.name) and f.name != "downloaded.txt"]
-    return {"rename": ok, "skipped": skipped, "done": done, "mismatched": mismatched, "orphans": orphans}
-
-
-def run_with_retries(run_pass, scan_dir: Path, passes: int, errlog) -> None:
-    """Run one download pass, then keep re-running while half-finished .part files remain.
-
-    Finished videos are skipped (archive) and .part files resume, so each extra pass is cheap.
-    """
-    run_pass()
-    for n in range(1, passes + 1):
-        left = find_incomplete(scan_dir)
-        if not left:
-            return
-        console.print(f"\n[yellow]↻ {len(left)} unfinished download(s) — retry pass {n}/{passes}…[/yellow]")
-        time.sleep(5)
-        errlog.errors.clear()        # only report errors that survive the last pass
-        run_pass()
-
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
 
 @click.group()
 def cli():
     """🎬  YouTube Playlist Downloader  (Windows Edition)"""
     pass
 
-
-# ── download ──────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("url")
@@ -840,8 +244,6 @@ def download(ctx, url, output, quality, resume, start, end, archive, audio, subs
     if notify_when_done:
         notify("YouTube download finished", f"{title}: {len(downloaded)} new, {len(failed)} failed")
 
-
-# ── channel ───────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("url")
@@ -1053,8 +455,6 @@ def channel(url, output, quality, tabs, limit, since, browser, yes, audio, subs,
         notify("YouTube download finished", f"{channel_name}: {len(downloaded)} new, {len(failed)} failed")
 
 
-# ── info ──────────────────────────────────────────────────────────────────────
-
 @cli.command()
 @click.argument("url")
 def info(url):
@@ -1084,8 +484,6 @@ def info(url):
         console.print(f"[dim]… and {len(entries)-60} more videos[/dim]")
 
 
-# ── repair ────────────────────────────────────────────────────────────────────
-
 @cli.command()
 @click.argument("folder", required=False)
 def repair(folder):
@@ -1108,8 +506,6 @@ def repair(folder):
         console.print(f"\n[bold green]Done![/bold green]  {fixed}/{found} merged.")
 
 
-# ── update ────────────────────────────────────────────────────────────────────
-
 @cli.command()
 def update():
     """Upgrade yt-dlp to the latest version (fixes most 403 and broken-download errors)."""
@@ -1126,8 +522,6 @@ def update():
     else:
         console.print("[green]✅ Already on the latest yt-dlp.[/green]")
 
-
-# ── batch ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True, dir_okay=False))
@@ -1205,8 +599,6 @@ def batch(ctx, file, output, quality, audio, subs, embed, rate_limit, notify_whe
         notify("YouTube batch finished", f"{len(urls)} URL(s) processed, {problems} need attention")
 
 
-# ── notify-test ───────────────────────────────────────────────────────────────
-
 @cli.command("notify-test")
 def notify_test():
     """Send a test notification, to check that --notify works on this computer."""
@@ -1214,8 +606,6 @@ def notify_test():
     notify("YT Downloader", "Notifications work ✅")
     console.print("Did a notification pop up (or did you hear a beep)? If not, --notify is silent here.")
 
-
-# ── add-ids ───────────────────────────────────────────────────────────────────
 
 @cli.command("add-ids")
 @click.argument("url")
@@ -1289,8 +679,6 @@ def add_ids(url, output, folder, apply_):
     console.print("Your next [cyan]yt download[/cyan] of this playlist uses the new names automatically.")
 
 
-# ── history ───────────────────────────────────────────────────────────────────
-
 @cli.command()
 @click.option("-n", "--last", default=20, show_default=True, help="Number of entries to show")
 def history(last):
@@ -1326,8 +714,6 @@ def history(last):
     console.print(f"\n[dim]History file: {HISTORY_FILE}[/dim]")
 
 
-# ── clear-history ─────────────────────────────────────────────────────────────
-
 @cli.command("clear-history")
 def clear_history():
     """Delete all download history."""
@@ -1340,8 +726,6 @@ def clear_history():
     else:
         console.print("[yellow]Cancelled.[/yellow]")
 
-
-# ── config ────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.option("--output",  default=None, help="Set default output folder")
@@ -1370,8 +754,6 @@ def config(output, quality):
 
     save_config(cfg)
 
-
-# ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cli()

@@ -58,7 +58,7 @@ jobs:
         run: yt --help
 
       - name: Lint
-        run: python -m pyflakes yt_downloader.py tests
+        run: python -m pyflakes yt_downloader.py ytdl tests
 
       - name: Run tests
         run: python -m pytest -q
