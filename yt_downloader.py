@@ -17,17 +17,16 @@ import subprocess
 import time
 import click
 from datetime import datetime
-from pathlib import Path, WindowsPath
+from pathlib import Path
 
 try:
     import yt_dlp
     from yt_dlp.utils import sanitize_filename, parse_bytes
     from yt_dlp.version import __version__ as YTDLP_VERSION
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
     from rich.table import Table
     from rich.panel import Panel
-    from rich.prompt import Prompt
     from rich.markup import escape
     from rich import box
 except ImportError:
@@ -557,6 +556,60 @@ def read_url_file(path) -> tuple:
         elif token not in urls:          # drop duplicates, keep order
             urls.append(token)
     return urls, bad
+
+
+# ── Add video ids to old file names ────────────────────────────────────────────
+
+MAX_PATH = 259 if os.name == "nt" else 4000          # Windows refuses longer paths
+
+
+def plan_id_renames(folder: Path, entries: list, expected_stem) -> dict:
+    """Work out how to rename old-style files ('001 - Title.mp4') to '001 - Title [id].mp4'.
+
+    entries:       the playlist's entries in order (None allowed), position = playlist index.
+    expected_stem: function(index, entry) -> the name yt-dlp WOULD have given that video, without extension.
+
+    A file only counts as belonging to a video if its name starts with that exact expected name, so a
+    changed or reordered playlist is never renamed wrongly. Everything is reported, nothing is touched.
+    """
+    files = sorted(f for f in folder.iterdir() if f.is_file())
+    plan, done, mismatched, claimed = [], 0, [], set()
+
+    for idx, entry in enumerate(entries, 1):
+        if not entry or not entry.get("id") or not entry.get("title"):
+            continue
+        stem = expected_stem(idx, entry)
+        tagged = f"{stem} [{entry['id']}]"
+        have_id = [f for f in files if f.name.startswith(tagged)]
+        mine = [f for f in files if f.name.startswith(stem + ".")]
+        claimed.update(have_id)
+        claimed.update(mine)
+        if have_id and not mine:
+            done += 1
+            continue
+        if not mine:
+            same_index = [f for f in files if f.name.startswith(f"{idx:03d} - ") and f not in claimed
+                          and not _ID_TAG.search(f.name)]
+            if same_index:
+                mismatched.append((idx, entry["title"], same_index[0].name))
+                claimed.update(same_index)
+            continue                                   # not downloaded yet
+        for f in mine:
+            plan.append((f, f.with_name(f"{tagged}{f.name[len(stem):]}")))
+
+    skipped = []
+    ok = []
+    for old, new in plan:
+        if new.exists():
+            skipped.append((old, "target already exists"))
+        elif len(str(new)) > MAX_PATH:
+            skipped.append((old, "new name would be too long for Windows"))
+        else:
+            ok.append((old, new))
+
+    orphans = [f for f in files if f not in claimed and re.match(r"\d+ - ", f.name)
+               and not _ID_TAG.search(f.name) and f.name != "downloaded.txt"]
+    return {"rename": ok, "skipped": skipped, "done": done, "mismatched": mismatched, "orphans": orphans}
 
 
 def run_with_retries(run_pass, scan_dir: Path, passes: int, errlog) -> None:
@@ -1160,6 +1213,80 @@ def notify_test():
     console.print("[yellow]Sending a test notification…[/yellow]")
     notify("YT Downloader", "Notifications work ✅")
     console.print("Did a notification pop up (or did you hear a beep)? If not, --notify is silent here.")
+
+
+# ── add-ids ───────────────────────────────────────────────────────────────────
+
+@cli.command("add-ids")
+@click.argument("url")
+@click.option("-o", "--output", default=None, help="Output folder  (default from config)")
+@click.option("--folder", type=click.Path(file_okay=False), default=None,
+              help="The playlist folder to fix  (default: worked out from the URL and --output)")
+@click.option("--apply", "apply_", is_flag=True, help="Really rename. Without this it only shows what it would do.")
+def add_ids(url, output, folder, apply_):
+    """Add [video id] to the names of files from older versions, so every file maps to its video.
+
+    Needs the playlist URL the folder was downloaded from. Files are matched by playlist number AND
+    exact title; anything that does not match is left alone. Dry run by default.
+    """
+    cfg = load_config()
+    output = safe_win_path(output or cfg.get("default_output", DEFAULT_OUTPUT))
+    console.print("[yellow]⏳ Fetching playlist info…[/yellow]")
+    info = fetch_playlist_info(url)
+    if not info or not info.get("entries"):
+        console.print("[red]❌  Could not read a playlist from that URL (single videos have nothing to fix).[/red]")
+        return
+    title = info.get("title", "Unknown Playlist")
+    entries = list(info["entries"])
+
+    opts = build_ydl_opts(output, "best", True, 1, 0, id_in_name=False)       # the OLD naming
+    target = Path(safe_win_path(folder)) if folder else playlist_folder(opts, info, title)
+    if not target.is_dir():
+        console.print(f"[red]Folder not found: {escape(str(target))}[/red]\n"
+                      "Use --output or --folder to point at it.")
+        return
+
+    with yt_dlp.YoutubeDL({**opts, "quiet": True, "logger": None}) as ydl:
+        def expected_stem(idx, entry):
+            probe = {"id": entry["id"], "title": entry["title"], "ext": "mp4",
+                     "playlist_title": title, "playlist_index": idx}
+            return Path(ydl.prepare_filename(probe)).name[:-len(".mp4")]
+        plan = plan_id_renames(target, entries, expected_stem)
+
+    console.print(f"\n[bold]Folder:[/bold] {escape(str(target))}")
+    console.print(f"  [green]{len(plan['rename'])}[/green] file(s) to rename   "
+                  f"[dim]{plan['done']} video(s) already have an id[/dim]")
+    for old, new in plan["rename"][:6]:
+        console.print(f"  [dim]{escape(old.name[-60:])}[/dim]\n    → {escape(new.name[-60:])}")
+    if len(plan["rename"]) > 6:
+        console.print(f"  [dim]… and {len(plan['rename']) - 6} more[/dim]")
+    for old, why in plan["skipped"][:5]:
+        console.print(f"  [yellow]skipped[/yellow] {escape(old.name[:50])} — {why}")
+    if plan["mismatched"]:
+        console.print(f"\n[yellow]⚠ {len(plan['mismatched'])} video(s) have a file with the same number but a "
+                      f"different title (playlist changed?). Left alone:[/yellow]")
+        for idx, want, found in plan["mismatched"][:5]:
+            console.print(f"  [dim]#{idx}: playlist says “{escape(want[:40])}”, folder has “{escape(found[:40])}”[/dim]")
+    if plan["orphans"]:
+        console.print(f"\n[dim]{len(plan['orphans'])} other numbered file(s) match no playlist video and stay as they are.[/dim]")
+
+    if not plan["rename"]:
+        console.print("\n[green]✅ Nothing to rename.[/green]")
+        return
+    if not apply_:
+        console.print("\n[bold yellow]Dry run — nothing was renamed.[/bold yellow] Add [cyan]--apply[/cyan] to do it.")
+        return
+
+    renamed, failed = 0, 0
+    for old, new in plan["rename"]:
+        try:
+            old.rename(new)
+            renamed += 1
+        except OSError as e:
+            failed += 1
+            console.print(f"  [red]✗[/red] {escape(old.name[:50])}: {escape(str(e)[:60])}")
+    console.print(f"\n[bold green]✅ Renamed {renamed} file(s).[/bold green]" + (f"  [red]{failed} failed[/red]" if failed else ""))
+    console.print("Your next [cyan]yt download[/cyan] of this playlist uses the new names automatically.")
 
 
 # ── history ───────────────────────────────────────────────────────────────────

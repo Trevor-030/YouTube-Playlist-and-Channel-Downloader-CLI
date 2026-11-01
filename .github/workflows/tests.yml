@@ -1,0 +1,64 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # every Monday: catches breakage from a new yt-dlp release before you hit it
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12"]
+    env:
+      PYTHONUTF8: "1"   # emoji in file names and output, like on a real Windows setup
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Show tool versions
+        run: |
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Install the package (also checks packaging)
+        run: python -m pip install ".[test]"
+
+      - name: Check the yt command starts
+        run: yt --help
+
+      - name: Lint
+        run: python -m pyflakes yt_downloader.py tests
+
+      - name: Run tests
+        run: python -m pytest -q

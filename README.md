@@ -114,6 +114,11 @@ yt info "URL"
 yt batch urls.txt
 yt batch urls.txt -q 720p --audio mp3 --subs en
 
+:: Add [video id] to the file names of an OLD folder (dry run first, then --apply)
+yt add-ids "https://youtube.com/playlist?list=YOUR_ID"
+yt add-ids "URL" --apply
+yt add-ids "URL" --folder "D:\Videos\Java tutorial"
+
 :: Update yt-dlp (fixes most 403 and broken-download errors)
 yt update
 
@@ -156,6 +161,10 @@ D:\Videos\
     ├── downloaded.txt
     └── ...
 ```
+
+Folders from older versions can be upgraded with `yt add-ids` (see above). It matches files by playlist number
+**and** exact title, shows a dry run first, and leaves anything that does not match alone. If a few files could
+not be matched, the folder keeps the old naming for new downloads until they are sorted out.
 
 The `[id]` ties every file (and any leftover part) to its video. `downloaded.txt` lists finished
 videos so re-runs only fetch what is missing — delete a line from it to force a re-download.
@@ -232,3 +241,7 @@ pytest
 ```
 
 The tests cover repair, retries and naming. They need ffmpeg on PATH and skip themselves without it.
+
+On GitHub, `.github/workflows/tests.yml` runs them automatically on every push, on Windows and Linux with
+Python 3.10 to 3.12. It also runs every Monday, so a broken new yt-dlp release shows up as a red build
+before it breaks your downloads.
