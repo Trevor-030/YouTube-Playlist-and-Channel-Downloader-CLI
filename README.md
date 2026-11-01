@@ -233,6 +233,24 @@ yt history --last 50
 
 ---
 
+## 🗂️ Project layout
+
+```
+yt_downloader.py     the commands (this is what `yt` runs)
+ytdl/                the building blocks the commands use
+├── options.py       quality, audio, subtitles, embed, speed limit -> yt-dlp options
+├── layout.py        folders, file naming, id renames, URL files, retry passes
+├── repair.py        merging split video/audio files, spotting .part leftovers
+├── checks.py        old yt-dlp warning, cut-off file check
+├── sources.py       reading playlist and channel info
+├── config.py        settings and history
+├── notifications.py desktop notification
+└── common.py        console, ffmpeg check, shared small helpers
+tests/               tests (fake yt-dlp, no internet needed)
+```
+
+Keep `yt_downloader.py` and the `ytdl` folder together; `yt.bat` runs the file, which loads the folder next to it.
+
 ## 🧪 Tests
 
 ```
