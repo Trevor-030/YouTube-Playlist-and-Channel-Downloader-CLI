@@ -1,6 +1,7 @@
 # 🎬 YouTube Playlist & Channel Downloader — Windows Edition
 
 A CLI tool to download YouTube playlists and entire channels with quality selection, resume support, and history tracking.
+It can also save **transcripts** of videos, playlists and whole channels as text, Markdown, JSON, SRT or VTT.
 
 ---
 
@@ -118,6 +119,17 @@ yt batch urls.txt -q 720p --audio mp3 --subs en
 yt add-ids "https://youtube.com/playlist?list=YOUR_ID"
 yt add-ids "URL" --apply
 yt add-ids "URL" --folder "D:\Videos\Java tutorial"
+
+:: Save transcripts (no video download). Videos, playlists, channels, @handles and video ids all work
+yt transcripts "https://youtu.be/VIDEO_ID"
+yt transcripts @ChannelName --format md --combine
+yt transcripts "PLAYLIST_URL" --format txt,srt --timestamps
+yt transcripts @ChannelName --lang en,fr --any-lang --shorts --limit 50
+yt transcripts -f targets.txt
+
+:: Re-run to resume: saved videos are skipped. If YouTube blocks you, slow down or use a proxy
+yt transcripts @ChannelName --workers 2 --delay 2
+yt transcripts @ChannelName --proxy "http://user:pass@host:port"
 
 :: Update yt-dlp (fixes most 403 and broken-download errors)
 yt update
@@ -243,6 +255,7 @@ ytdl/                the building blocks the commands use
 ├── repair.py        merging split video/audio files, spotting .part leftovers
 ├── checks.py        old yt-dlp warning, cut-off file check
 ├── sources.py       reading playlist and channel info
+├── transcripts.py   the `yt transcripts` command: fetching, formats, resume
 ├── config.py        settings and history
 ├── notifications.py desktop notification
 └── common.py        console, ffmpeg check, shared small helpers

@@ -2,6 +2,20 @@
 
 All notable changes to this project. Newest first.
 
+## [1.2.0] - 2026-11-19
+
+### Added
+- `yt transcripts` saves video transcripts without downloading the videos. It merges the separate
+  YouTube Transcript Downloader project into this tool.
+  - Takes video, playlist and channel URLs, `@handles`, channel ids (`UC…`), video ids, or a file of them (`-f`).
+  - Formats: `txt`, `md`, `json`, `srt`, `vtt` (`--format txt,srt`). `--timestamps` adds `[mm:ss]` to text output.
+  - Language choice with fallback (`--lang en,fr`, `--any-lang`). Channels can include Shorts and streams.
+  - Resumes: saved videos are skipped on re-runs, and `index.csv` records each video's status.
+  - `--combine` writes one `_all_transcripts.md` per channel or playlist.
+  - When YouTube blocks the IP, retries with backoff, then stops cleanly with exit code 1 so you can resume later.
+    `--workers`, `--delay` and `--proxy` help avoid blocks.
+- New dependency: `youtube-transcript-api`.
+
 ## [1.1.0] - 2026-11-01
 
 ### Fixed
