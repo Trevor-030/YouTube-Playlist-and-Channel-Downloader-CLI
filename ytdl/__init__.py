@@ -3,9 +3,9 @@
 import importlib.util
 import sys
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
-_missing = [m for m in ("yt_dlp", "rich", "click") if importlib.util.find_spec(m) is None]
+_missing = [m for m in ("yt_dlp", "rich", "click", "youtube_transcript_api") if importlib.util.find_spec(m) is None]
 if _missing:
-    print('Missing dependencies. Run:  pip install "yt-dlp[default]" rich click')
+    print('Missing dependencies. Run:  pip install "yt-dlp[default]" rich click youtube-transcript-api')
     sys.exit(1)

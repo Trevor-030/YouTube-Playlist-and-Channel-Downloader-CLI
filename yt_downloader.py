@@ -34,6 +34,8 @@ from ytdl.notifications import notify
 from ytdl.options import AUDIO_FORMATS, QUALITY_OPTIONS, build_ydl_opts, parse_langs, parse_rate, warn_embed
 from ytdl.repair import repair_folder
 from ytdl.sources import CHANNEL_TABS, channel_base, fetch_playlist_info, is_channel_url, resolve_url
+from ytdl.transcripts import FORMATS as TRANSCRIPT_FORMATS, Options as TranscriptOptions, read_targets
+from ytdl.transcripts import run_target as run_transcripts
 
 
 @click.group()
@@ -597,6 +599,66 @@ def batch(ctx, file, output, quality, audio, subs, embed, rate_limit, notify_whe
     if notify_when_done:
         problems = sum(1 for _, icon, _ in results if "✗" in icon or "⚠" in icon) + skipped
         notify("YouTube batch finished", f"{len(urls)} URL(s) processed, {problems} need attention")
+
+
+@cli.command()
+@click.argument("targets", nargs=-1)
+@click.option("-f", "--file", "url_file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Text file with one target per line ('#' starts a comment)")
+@click.option("-o", "--output", default=None,
+              help="Output folder  (default: a 'Transcripts' folder inside your default output)")
+@click.option("-l", "--lang", default="en", show_default=True,
+              help="Preferred language codes, comma-separated, best first, e.g. en,fr")
+@click.option("--any-lang", is_flag=True, help="If none of --lang exists, take whatever language the video has")
+@click.option("--format", "fmt", default="txt", show_default=True, metavar="FORMATS",
+              help=f"Comma-separated, any of: {','.join(TRANSCRIPT_FORMATS)}")
+@click.option("--timestamps", is_flag=True, help="Put [mm:ss] before each line in txt/md")
+@click.option("--shorts", is_flag=True, help="Channels: also include the Shorts tab")
+@click.option("--streams", is_flag=True, help="Channels: also include past live streams")
+@click.option("--limit", default=0, show_default=True, type=click.IntRange(0),
+              help="Only the first N videos of each target (0 = all)")
+@click.option("-w", "--workers", default=4, show_default=True, type=click.IntRange(1, 16),
+              help="Transcripts fetched at the same time")
+@click.option("--delay", default=0.5, show_default=True, type=click.FloatRange(0),
+              help="Average seconds to wait before each request (raise it if YouTube blocks you)")
+@click.option("--retries", default=3, show_default=True, type=click.IntRange(0),
+              help="Retries when blocked or on network errors")
+@click.option("--proxy", default=None, metavar="URL", help="HTTP(S) proxy, e.g. http://user:pass@host:port")
+@click.option("--combine", is_flag=True, help="Also write one _all_transcripts.md per channel or playlist")
+@click.option("--overwrite", is_flag=True, help="Fetch again even when the files already exist")
+def transcripts(targets, url_file, output, lang, any_lang, fmt, timestamps, shorts, streams, limit,
+                workers, delay, retries, proxy, combine, overwrite):
+    """Save video transcripts as txt, md, json, srt or vtt.
+
+    TARGETS can be video, playlist or channel URLs, @handles, channel ids (UC…) or video ids.
+    Re-running the same command skips videos that are already saved.
+    """
+    targets = list(targets) + (read_targets(url_file) if url_file else [])
+    if not targets:
+        raise click.UsageError("Give at least one URL, @handle or video id, or use --file.")
+
+    formats = [f.strip().lower() for f in fmt.split(",") if f.strip()]
+    bad = [f for f in formats if f not in TRANSCRIPT_FORMATS]
+    if bad or not formats:
+        raise click.BadParameter(f"unknown format(s): {', '.join(bad) or fmt!r}", param_hint="--format")
+    if combine and "md" not in formats:
+        formats.append("md")          # the combined file is built from the .md files
+
+    langs = [c.strip() for c in lang.split(",") if c.strip()] or ["en"]
+    out = safe_win_path(output) if output else str(Path(load_config()["default_output"]) / "Transcripts")
+    opts = TranscriptOptions(out=Path(out), langs=langs, formats=formats, any_lang=any_lang,
+                             timestamps=timestamps, shorts=shorts, streams=streams, limit=limit,
+                             workers=workers, delay=delay, retries=retries, proxy=proxy,
+                             combine=combine, overwrite=overwrite)
+
+    ok = True
+    for t in targets:
+        finished, _ = run_transcripts(t, opts)
+        ok = finished and ok
+        if not finished:
+            break                     # blocked: the next targets would be blocked too
+    if not ok:
+        raise SystemExit(1)
 
 
 @cli.command("notify-test")
