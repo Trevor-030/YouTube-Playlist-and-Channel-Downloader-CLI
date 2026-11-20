@@ -1,4 +1,4 @@
-# 🎬 YouTube Playlist & Channel Downloader — Windows Edition
+# 🎬 YouTube Playlist, Channel & Transcript Downloader — Windows Edition
 
 A CLI tool to download YouTube playlists and entire channels with quality selection, resume support, and history tracking.
 It can also save **transcripts** of videos, playlists and whole channels as text, Markdown, JSON, SRT or VTT.
